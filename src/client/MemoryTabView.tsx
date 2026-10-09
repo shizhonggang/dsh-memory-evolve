@@ -136,6 +136,13 @@ function parseEntries(row: MemoryFileRow): MemoryEntry[] {
         dshOnly = true
         text = text.replace(DSH_ONLY_RE, '')
       }
+      // 「摘要」标记 [summary:...]（dsh-only 之后、正文之前）：程序元数据，
+      // 仅供摘要模式注入；卡片显示完整正文时不再展示（2026-08-15，与快照
+      // 全量注入同规则）。raw 原文保留（删除/编辑匹配用）。
+      // 审查修复：此处时间戳/[git …]/[branch:…]/[dsh-only] 已在上方各自
+      // 剥离，直接 ^ 锚定剥头部 summary 即可——原 head 前缀正则恒匹配空串
+      // （死代码），且正文中出现的 [summary:…] 文本因不在行首不被误剥。
+      text = text.replace(/^\[summary:[^\]]*\]\s*/, '')
     }
     entries.push({ time, tag, branch, text, branches, dshOnly, raw: rawText })
   }
@@ -261,6 +268,10 @@ export function MemoryTabView(props: ConvViewProps & MemoryTabViewProps): JSX.El
   /** 手动添加项目关键记忆的草稿与保存状态。 */
   const [keyDraft, setKeyDraft] = useState('')
   const [keySaving, setKeySaving] = useState(false)
+  /** 手动添加全局记忆（MEMORY.md / USER.md 页签）的草稿（按文件 key 分桶，
+   *  切页签不丢草稿）与保存状态（issue #30）。 */
+  const [globalDrafts, setGlobalDrafts] = useState<Record<string, string>>({})
+  const [globalSaving, setGlobalSaving] = useState(false)
   /** 手动添加时的「仅 DSH」勾选：勾上 = 条目带 [dsh-only] 标记（只注入 DSH 自身，外部执行器跳过）。 */
   const [keyDshOnly, setKeyDshOnly] = useState(false)
   /** 手动添加时的分支范围选择：[] = 全部（与具体分支互斥，全部权重最大）。 */
@@ -373,6 +384,24 @@ export function MemoryTabView(props: ConvViewProps & MemoryTabViewProps): JSX.El
     }).catch((error: Error) => {
       setNotice({ kind: 'error', text: error.message })
     }).finally(() => setKeySaving(false))
+  }
+
+  /** 手动写入一条全局轨记忆（MEMORY.md / USER.md）：走宿主 API 的 store.add
+   *  （全局轨不依赖会话 cwd，故无需 sessionId；日期由程序自动盖戳，issue #30）。 */
+  const saveGlobal = (key: 'memory' | 'user'): void => {
+    const content = (globalDrafts[key] ?? '').trim()
+    if (content === '' || globalSaving) return
+    setGlobalSaving(true)
+    void api<{ ok: boolean }>(`/api/memory/${key}`, {
+      method: 'POST',
+      body: JSON.stringify({ content }),
+    }).then(() => {
+      setGlobalDrafts((prev) => ({ ...prev, [key]: '' }))
+      load()
+      flash(t('memoryTab.memoryUserAdded'))
+    }).catch((error: Error) => {
+      setNotice({ kind: 'error', text: error.message })
+    }).finally(() => setGlobalSaving(false))
   }
 
   /** 分支选择互斥：勾「全部」→ 清空所有分支；勾具体分支 → 自动取消「全部」（全部权重最大）。 */
@@ -713,6 +742,33 @@ export function MemoryTabView(props: ConvViewProps & MemoryTabViewProps): JSX.El
                       onClick={saveKey}
                     >
                       {t('memoryTab.keyAdd')}
+                    </button>
+                  </div>
+                </div>
+              )}
+              {/* 全局轨手动添加（issue #30）：MEMORY.md / USER.md 页签顶部与
+                  KEY.md 同款输入框——用户手动记一条长期事实，保存后程序盖戳
+                  追加，下一轮全局注入生效（KEY 有分支/DSH 选项，这里无）。 */}
+              {(activeRow.key === 'memory' || activeRow.key === 'user') && activeRow.available && (
+                <div className="mt-key-add">
+                  <textarea
+                    className="mt-key-input"
+                    rows={2}
+                    value={globalDrafts[activeRow.key] ?? ''}
+                    placeholder={activeRow.key === 'memory'
+                      ? t('memoryTab.memoryAddPlaceholder')
+                      : t('memoryTab.userAddPlaceholder')}
+                    onChange={(event) => setGlobalDrafts((prev) => ({ ...prev, [activeRow.key]: event.target.value }))}
+                  />
+                  <div className="mt-key-add-foot">
+                    <span className="mt-key-help">{t('memoryTab.memoryUserAddHelp')}</span>
+                    <button
+                      type="button"
+                      className="mt-btn mt-btn-primary"
+                      disabled={globalSaving || (globalDrafts[activeRow.key] ?? '').trim() === ''}
+                      onClick={() => { void saveGlobal(activeRow.key as 'memory' | 'user') }}
+                    >
+                      {t('memoryTab.memoryAdd')}
                     </button>
                   </div>
                 </div>

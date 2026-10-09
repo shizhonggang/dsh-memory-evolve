@@ -12,6 +12,10 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { SessionOrch, SessionOrchStore, sessionToolDefinition, installSession } from '../lib/session-orch.js'
 
+// This suite pins the legacy Chinese output contract; i18n.test.js covers English.
+import { setLocale } from '../lib/i18n.js'
+setLocale('zh')
+
 /** 独立临时目录（每个测试隔离）。 */
 function tempDir() {
   return join(tmpdir(), `dsh-session-orch-test-${process.pid}-${Math.random().toString(36).slice(2, 10)}`)
@@ -161,6 +165,73 @@ test('SessionOrchStore: spawn 记录落盘/查找/列表', () => {
   const store2 = new SessionOrchStore(dir)
   assert.equal(store2.list().length, 2)
   assert.equal(store2.find('session-b').roomId, 'room-1')
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('SessionOrch resolves an optional workspace service lazily', () => {
+  const dir = tempDir()
+  const ctx = makeCtx(makeFakeAgents())
+  const workspace = ctx.workspaceRegistry
+  let published
+  ctx.get = (name) => (name === 'workspaceRegistry' ? published : undefined)
+  const orch = new SessionOrch(ctx, {
+    store: new SessionOrchStore(dir),
+    getBroadcastStore: () => undefined,
+  })
+
+  assert.equal(orch.workspace, undefined, 'headless starts without workspaceRegistry')
+  published = workspace
+  assert.equal(orch.workspace, workspace, 'a later web-host service is observed on demand')
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('attachWorkspace keeps one optional-service generation per attempt', async () => {
+  const dir = tempDir()
+  const ctx = makeCtx(makeFakeAgents())
+  let published
+  let created = 0
+  let attached = null
+  const firstGeneration = {
+    resolveByPath: async () => {
+      published = undefined
+      return undefined
+    },
+    create: async () => {
+      created += 1
+      return { id: 'ws-stable', title: 'stable', attachSession: async (sid) => { attached = sid } }
+    },
+  }
+  published = firstGeneration
+  ctx.get = (name) => (name === 'workspaceRegistry' ? published : undefined)
+  const orch = new SessionOrch(ctx, {
+    store: new SessionOrchStore(dir),
+    getBroadcastStore: () => undefined,
+    attachDelays: [0],
+  })
+
+  const result = await orch.attachWorkspace('session-child', dir)
+  assert.equal(result.ok, true)
+  assert.equal(created, 1, 'create must use the same provider captured before resolveByPath')
+  assert.equal(attached, 'session-child')
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('de_session schema: Code Mode 安全——模型可见文本不含 {{ 模板语法', () => {
+  const dir = tempDir()
+  const ctx = makeCtx(makeFakeAgents())
+  const orch = new SessionOrch(ctx, { store: new SessionOrchStore(dir), getBroadcastStore: () => undefined })
+  const tool = sessionToolDefinition(orch)
+  // Code Mode 把工具 schema 文本序列化进 tools:sdk 提示词段，宿主渲染器将
+  // {{...}} 当模板变量解析（未注册即 throw unknown prompt variable，见
+  // issue #13 / PR #10）——插件侧 schema 文本绝不能泄漏该语法（与
+  // de_prompts 同款回归）。回归断言：description/parameters/output
+  // 均不得含 {{ 序列。
+  const modelFacingSchema = JSON.stringify({
+    description: tool.description,
+    parameters: tool.parameters,
+    output: tool.output?.schema,
+  })
+  assert.equal(modelFacingSchema.includes('{{'), false, 'de_session schema must be safe for Code Mode prompt rendering')
   rmSync(dir, { recursive: true, force: true })
 })
 

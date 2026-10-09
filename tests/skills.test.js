@@ -8,6 +8,10 @@ import {
   approvePendingSkill, listPendingSkills, rejectPendingSkill,
 } from '../lib/skills.js'
 
+// This suite pins the legacy Chinese output contract; i18n.test.js covers English.
+import { setLocale } from '../lib/i18n.js'
+setLocale('zh')
+
 function tempDir() {
   return mkdtempSync(join(tmpdir(), 'dsh-skill-test-'))
 }
@@ -63,6 +67,16 @@ test('parseFrontmatter accepts canonical skills and rejects malformed ones', () 
   // quoted description
   const quoted = parseFrontmatter('---\nname: a-b\ndescription: "带 空格 的描述"\n---\nbody')
   assert.equal(quoted.description, '带 空格 的描述')
+})
+
+test('parseFrontmatter handles Windows CRLF line endings (issue #17)', () => {
+  // Windows 下 SKILL.md 是 CRLF 行尾：修复前行内字段正则不匹配 "name: foo\r"
+  // 整行 → frontmatter 解析 undefined → 技能被静默跳过（回归测试）。
+  const crlf = '---\r\nname: demo-skill\r\ndescription: 演示技能\r\n---\r\n# 正文\r\n'
+  const parsed = parseFrontmatter(crlf)
+  assert.equal(parsed.name, 'demo-skill')
+  assert.equal(parsed.description, '演示技能')
+  assert.ok(parsed.body.includes('# 正文'))
 })
 
 test('listSkills and readSkill', () => {

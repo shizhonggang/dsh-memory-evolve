@@ -8,6 +8,42 @@
 
 ---
 
+## Quick Start (Installation)
+
+The plugin ships its own `cordis.patch.yml` (declared via `dsh.bundle.patch`), so after `dsh plugin add` the **host side registers automatically — no manual configuration needed**. Using the web profile as an example, two steps:
+
+```sh
+# 1. Install into the profile (use link: for a local directory; git/registry
+#    package addresses also work)
+dsh plugin --profile web add github:csyangwen/dsh-memory-evolve
+
+# 2. Restart dsh web — done
+```
+
+> ⚠️ **Do NOT manually `insert` this plugin into `~/.dsh/profiles/web/cordis.patch.yml`**: the bundle patch already registers it; a duplicate insert with the same id crashes the loader with a duplicate loader entry id error. See the [detailed guide](README-详细说明.md) "标准安装" section for the full story.
+
+**Changing default config** (e.g. turning on per-turn memory review): override by id in the profile's `cordis.patch.yml` (top-level form, not an insert):
+
+```yaml
+- id: dsh-memory-evolve
+  config:
+    reviewEnabled: true      # enable per-turn memory review (off by default)
+    reviewInterval: 10       # review every 10 user turns
+```
+
+**Temporarily disabling the plugin when it breaks DSH startup** (until the fix lands): add one line to the profile's `cordis.patch.yml` — no uninstall needed:
+
+```yaml
+- id: dsh-memory-evolve
+  disabled: true
+```
+
+**Upgrading from an older version**: if you previously inserted this plugin manually per older docs, delete that insert block from your profile patch (it now duplicates the bundle registration).
+
+To uninstall: `dsh plugin --profile web remove dsh-memory-evolve`. Everything is cleaned up automatically.
+
+---
+
 ## Meet It (30 Seconds)
 
 After installing the plugin, open any session and you'll get a row of capability tabs: **Memory · Skills · Todos · Infinite Canvas · COI Scheduling · Session Broadcast · Prompts · Memory Sync · Model Settings · Bookmarks · Session Review · Web UI Settings · Memory Evolve Settings**. On the AI side, you get a batch of tools: memory read/write, todos, skill management, local file search, session orchestration, session broadcast, external-AI dispatch, prompt injection, model query, and more.

@@ -195,7 +195,7 @@ function writeDock(dock: BellDock): void {
 /* ------------------------------------------------------------------ */
 
 /** 邮件字段行：📮 主题：xxx / 📝 简介：xxx / 📄 内容（值可空，正文在后续行）。 */
-const MAIL_FIELD_RE = /^(📮|📝|👤|🕐|📄)\s*(主题|简介|发送人|时间|内容)\s*[：:]?\s*(.*)$/
+const MAIL_FIELD_RE = /^(📮|📝|👤|🕐|📄)\s*(主题|简介|发送人|时间|内容|Subject|Intro|Sender|Time|Content)\s*[：:]?\s*(.*)$/
 /** 纯装饰分隔线（━ / ─ / — / - / = 重复），展示时丢掉。 */
 const SEP_RE = /^[━─—\-_=]{4,}\s*$/
 
@@ -209,7 +209,7 @@ function collapseBlank(text: string): string {
 
 /** 去掉「📮 主题：」这类字段前缀，避免主题栏再显示一遍「主题」。 */
 function stripSubjectPrefix(s: string): string {
-  return String(s ?? '').replace(/^[📮📝👤🕐📄]\s*(主题|简介|发送人|时间|内容)\s*[：:]\s*/, '').trim()
+  return String(s ?? '').replace(/^[📮📝👤🕐📄]\s*(主题|简介|发送人|时间|内容|Subject|Intro|Sender|Time|Content)\s*[：:]\s*/, '').trim()
 }
 
 /**
@@ -244,11 +244,11 @@ function parseNotifyContent(raw: string): MailFields {
       result.mail = true
       const key = m[2]
       const val = (m[3] ?? '').trim()
-      if (key === '主题') result.subject = val
-      else if (key === '简介') result.intro = val
-      else if (key === '发送人') result.sender = val
-      else if (key === '时间') result.time = val
-      else if (key === '内容') {
+      if (key === '主题' || key === 'Subject') result.subject = val
+      else if (key === '简介' || key === 'Intro') result.intro = val
+      else if (key === '发送人' || key === 'Sender') result.sender = val
+      else if (key === '时间' || key === 'Time') result.time = val
+      else if (key === '内容' || key === 'Content') {
         inBody = true
         if (val) bodyLines.push(val)
       }
@@ -298,6 +298,50 @@ function previewText(item: NotificationItem): string {
     text = collapseBlank(text.slice(text.indexOf('\n') === -1 ? text.length : text.indexOf('\n')))
   }
   return text
+}
+
+/* ------------------------------------------------------------------ */
+/* 正文链接化（markdown 链接 + 裸 URL → 可点击 <a>）                   */
+/* ------------------------------------------------------------------ */
+
+/**
+ * 正文里的链接识别正则（一次匹配两种形态，交替捕获组）：
+ *   1) markdown 链接：[标题](https://...)
+ *   2) 裸 URL：https://...
+ * URL 只接受 http(s) 且排除空白/尖括号/引号/括号字符（防 XSS 属性注入、
+ * 防吞掉相邻标点）；标题允许任意字符（除 ] 与换行）。
+ */
+const NOTIFY_LINK_RE = /\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)|(https?:\/\/[^\s<>()"'\]]+)/g
+
+/**
+ * 把通知正文渲染为可点击链接：
+ * - 命中 markdown 链接 / 裸 URL 时返回 React 节点数组（<a target="_blank"
+ *   rel="noreferrer">，href 恒为 http(s)，文本经 React 转义，无 XSS）；
+ * - 未命中任何链接时原样返回字符串（仅移除 markdown 加粗符 **），
+ *   调用方可直接当 children 渲染（字符串/数组 React 都接受）。
+ * 返回类型 string | ReactNode[]：preview 与详情弹窗两处复用。
+ */
+function linkify(text: string | null | undefined): string | React.ReactNode[] {
+  const s = String(text ?? '')
+  NOTIFY_LINK_RE.lastIndex = 0 // 全局正则跨调用复用，必须重置游标
+  const parts: (string | { u: string; l: string })[] = []
+  let last = 0
+  let m: RegExpExecArray | null
+  while ((m = NOTIFY_LINK_RE.exec(s)) !== null) {
+    if (m.index > last) parts.push(s.slice(last, m.index))
+    if (m[1] !== undefined) parts.push({ u: m[2], l: m[1] }) // markdown 链接：u=URL l=标题
+    else parts.push({ u: m[3], l: m[3] }) // 裸 URL：u 与 l 都是 URL 本身
+    last = NOTIFY_LINK_RE.lastIndex
+  }
+  if (last < s.length) parts.push(s.slice(last))
+  if (parts.length === 0) return s.replace(/\*\*/g, '')
+  return parts.map((p, k) =>
+    p && typeof p === 'object' ? (
+      <a key={k} href={p.u} target="_blank" rel="noreferrer">{p.l}</a>
+    ) : (
+      String(p).replace(/\*\*/g, '')
+    )
+  )
 }
 
 /** 时间显示：当天 HH:mm，跨天 MM-DD HH:mm。 */
@@ -643,10 +687,10 @@ function Bell({ openSession, t }: NotificationBellOpts): JSX.Element {
                   >
                     {displaySubject(item)}
                   </button>
-                  {/* 内容：已去重主题、折叠空行；长文截断 + 「查看详情」。 */}
+                  {/* 内容：已去重主题、折叠空行；长文截断 + 「查看详情」。正文链接化（linkify）。 */}
                   {preview ? (
                     <div className={`me-notify-content${item.isLong ? ' me-notify-content-clamped' : ''}`}>
-                      {preview}
+                      {linkify(preview)}
                     </div>
                   ) : null}
                   {item.attachments.length > 0 && <AttachmentList item={item} />}
@@ -706,7 +750,7 @@ function Bell({ openSession, t }: NotificationBellOpts): JSX.Element {
                   )}
                 </div>
               ) : (
-                <pre className="me-notify-modal-content">{collapseBlank(modal.content)}</pre>
+                <pre className="me-notify-modal-content">{linkify(collapseBlank(modal.content))}</pre>
               )}
               {modal.item.attachments.length > 0 && <AttachmentList item={modal.item} />}
               <div className="me-notify-detail-actions">

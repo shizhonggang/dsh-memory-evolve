@@ -85,6 +85,20 @@
   color: var(--dsw-alias-label-primary);
   box-shadow: 0 8px 24px var(--dsw-alias-border-l4);
   cursor: pointer;
+  /* 2026-08-17 issue #11 评论反馈：胶囊可拖拽（2026-08-17 用户拍板：
+     **只能吸附右边缘、沿最右边上下移动**——Pointer Events 只改 top，
+     水平方向由 right: 0 固定贴右，不允许拖到页面中间；位置记忆到
+     localStorage）。grab 提示可拖、user-select 防止拖拽中选中文字、
+     touch-action 禁止触屏上拖拽时滚动页面 */
+  cursor: grab;
+  user-select: none;
+  touch-action: none;
+}
+
+/* 拖拽进行中：手势提示 + 高亮描边，让用户知道正在移动 */
+.advisor-capsule.advisor-capsule-dragging {
+  cursor: grabbing;
+  box-shadow: 0 8px 24px var(--dsw-alias-border-l4), 0 0 0 1px var(--dsw-alias-state-business-primary);
 }
 
 .advisor-capsule:hover {
@@ -275,7 +289,7 @@
 .advisor-status-disabled {
   border-color: var(--dsw-alias-border-l3);
   background: var(--dsw-alias-interactive-bg-hover);
-  color: var(--dsw-alias-label-dimmed);
+  color: var(--dsw-alias-label-tertiary);
 }
 
 .advisor-status-halted {
@@ -311,7 +325,7 @@
 }
 
 .advisor-switch:disabled {
-  color: var(--dsw-alias-label-dimmed);
+  color: var(--dsw-alias-label-tertiary);
   cursor: default;
 }
 
@@ -465,7 +479,7 @@
 }
 
 .advisor-muted {
-  color: var(--dsw-alias-label-dimmed);
+  color: var(--dsw-alias-label-tertiary);
   font-size: 10px;
 }
 
@@ -699,14 +713,14 @@
   padding: 7px 8px;
   border: 1px dashed var(--dsw-alias-border-l2);
   border-radius: 8px;
-  color: var(--dsw-alias-label-dimmed);
+  color: var(--dsw-alias-label-tertiary);
   font-size: 10px;
   text-align: center;
 }
 
 .advisor-note-meta {
   margin-bottom: 3px;
-  color: var(--dsw-alias-label-dimmed);
+  color: var(--dsw-alias-label-tertiary);
   font-size: 9px;
 }
 
@@ -828,7 +842,7 @@
 
 .advisor-input::placeholder,
 .advisor-textarea::placeholder {
-  color: var(--dsw-alias-label-dimmed);
+  color: var(--dsw-alias-label-tertiary);
 }
 
 .advisor-button {
@@ -912,7 +926,7 @@
 .advisor-steer-hint,
 .advisor-settings-hint {
   margin-top: 5px;
-  color: var(--dsw-alias-label-dimmed);
+  color: var(--dsw-alias-label-tertiary);
   font-size: 9px;
   line-height: 1.4;
 }
@@ -926,7 +940,7 @@
 }
 
 .advisor-scope-hint {
-  color: var(--dsw-alias-label-dimmed);
+  color: var(--dsw-alias-label-tertiary);
   font-size: 9px;
   line-height: 1.4;
 }

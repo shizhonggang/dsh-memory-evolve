@@ -36,7 +36,7 @@
 ## 特性
 
 - **分层记忆（五轨）**：用户档案 · 全局事实 · 项目关键记忆（按工作目录隔离，**自动注入上下文**，**可限定 git 分支范围**）· 项目日志（按工作目录隔离）· 每日日志，注入范围随层级收窄，互不污染；
-- **每回合实时记录**：快照内固定提示行要求模型**在最终回复消息中先输出完整回复文本、再在文本之后附带工具调用**——每轮收尾向项目日志/每日日志**各写入 1 条**本回合进展，并**按重要性判断**是否向项目关键记忆（`key`）**提交建议**（用户确认后写入并注入，见「分层记忆」表），最后调用 `memory_review_status` 检查审查是否到期（到达间隔时静默执行全局记忆建议与技能审查）；时间戳、每日日志的**项目标签**与日志的 **git 分支 tag**（`[git 分支名]`）均由程序自动标注；可在「Memory Evolve 设置」Tab 的「配置」分别关闭「每回合写入项目日志 / 每日日志 / 检查项目关键记忆」；
+- **每回合实时记录**：快照内固定提示行要求模型**每轮收尾分两步（① 单独一条消息只发写入工具调用、不写正文；② 下一条消息输出完整回复、无工具调用结束 turn）**——每轮收尾向项目日志/每日日志**各写入 1 条**本回合进展，并**按重要性判断**是否向项目关键记忆（`key`）**提交建议**（用户确认后写入并注入，见「分层记忆」表），最后调用 `memory_review_status` 检查审查是否到期（到达间隔时静默执行全局记忆建议与技能审查）；时间戳、每日日志的**项目标签**与日志的 **git 分支 tag**（`[git 分支名]`）均由程序自动标注；可在「Memory Evolve 设置」Tab 的「配置」分别关闭「每回合写入项目日志 / 每日日志 / 检查项目关键记忆」；
 - **回合内自我审查**：每 N 个用户回合，插件把一次记忆审查标记为到期，**主 LLM 在自己回合内静默执行**（提示词驱动 + `memory_review_status` 工具计数）——不再派生子代理、不重建转录，模型直接基于完整上下文审查：产出全局记忆建议（`memory_suggest`，用户确认后入库）并创建/优化技能；
 - **可追溯审查**：审查在主会话内进行，天然拥有全部上下文（工具输出、推理过程、对话细节零损耗），无需摘要重建、无需深读接口；
 - **技能自我进化（创建需确认）**：审查优化 `~/.agents/skills` 下已有技能（read-before-write 保护）；**新技能默认进入待确认队列**，会话页记忆 Tab 采纳后才移入技能库（创建门槛严格：多次踩坑、难度大、后续会复用才创建）——技能注入所有会话，必须克制；
@@ -183,8 +183,9 @@ DSH 会话之间传递消息的轻量子功能，**独立于 COI 调度框架**�
   - **长内容**：超过 8KB 自动写入文件 `broadcast/broadcasts/<id>.txt`，接收方 read 时返回全文（文件随消息删除一并清理）；
   - **图片附件**（DSH 260810+ 图片机制）：`send` 可带 `attachments`（每项 `path` 本地路径 / `url` http(s) / `base64` 内联，≤5MiB/张、≤10 张，仅 PNG/JPEG/WebP/GIF，魔数嗅探真实类型）；图片存 `broadcast/attachments/<msgId>-<序号>.<ext>`（消息 JSON 只存元数据）；**read/list 渲染文本直接含附件 file 绝对路径**（AI 可读图/转发给 de_channel_send）；收件箱 GUI 显示 64px 缩略图（点击看原图）；附件在消息删除后**延迟保留 24h**（给 AI 留转发/读图窗口）由 prune 清理孤儿；子开关 `broadcastImageEnabled`（默认开，关=带图发送明确报错不静默忽略）；
   - **清理**：消息 30 天自动过期；**房间 30 天无活动（无人发消息/加入）自动删除连同其消息**（启动 + 每日定时 prune）；
+  - **投递即唤醒（wake，2026-09-04 吸收 PR #37）**：`send` 可带 `wake: true`——接收方消息投递走 DSH 核心两个原语：**idle（等用户驱动）→ followup 唤醒**（投递到下一回合并启动驱动，等价替用户给它发消息，与 de_session wake / COI wakeOnComplete 同款机制；唤醒的消息体带「发送方唤醒了你」标记）；**running → inject**（当前回合下一步即被认领，不打断）；**offline（不在本进程）→ 跳过**（消息仍在收件箱，会话回来由首次出现补投兜底）。回执**始终**附「已唤醒 N 个空闲接收方」计数（含 0——接收方全 running/offline 时一眼知道没人被唤醒，改走 de_session wake 或等待）。缺省 `wake: false` 保持原行为（只投不唤醒——这是为什么"广播有时像唤醒了、有时没动静"：接收方恰好在跑 = 同回合可见像被唤醒；接收方 idle = 消息停在收件箱直到下次自然驱动）；
   - **边界**：快照定点注入 = 对方"下一次生成前"才看到，**非实时 IM**（长任务中实时性取决于对方是否回合内 wait/轮询）。
-- **工具（de_broadcast，action 参数）**：`send`（recipients 必填 / content 必填 / subject 可选）/ `list`（收件箱式：只显示主题+简介，像邮件列表）/ `read`（全文并标记已读，快照提示随之消失）/ `delete`（手动删除，发送方或可见者）/ `room-create` / `room-join` / `room-leave` / `room-list` / `room-rm`（聊天室：房间成员=会话 ID 数组，**跨工作目录**，成员同时收到消息；发送者须是成员；创建者可解散；房间消息保留 30 天供回看）/ `presence`（**在线状态查询**：roomId 列出房间成员谁在线 running=正在生成、谁已结束回合 idle=等用户驱动相当于离线——**避免傻等已离线的会话**；sessionId 查单个；返回 lastActiveAt）。
+- **工具（de_broadcast，action 参数）**：`send`（recipients 必填 / content 必填 / subject 可选 / **wake 可选：true=投递即唤醒 idle 接收方**）/ `list`（收件箱式：只显示主题+简介，像邮件列表）/ `read`（全文并标记已读，快照提示随之消失）/ `delete`（手动删除，发送方或可见者）/ `room-create` / `room-join` / `room-leave` / `room-list` / `room-rm`（聊天室：房间成员=会话 ID 数组，**跨工作目录**，成员同时收到消息；发送者须是成员；创建者可解散；房间消息保留 30 天供回看）/ `presence`（**在线状态查询**：roomId 列出房间成员谁在线 running=正在生成、谁已结束回合 idle=等用户驱动相当于离线——**避免傻等已离线的会话**；sessionId 查单个；返回 lastActiveAt）。
 - **房间使用**：`room-create`（创建者自动入房）→ 把房间 id 告诉其他会话（用户粘贴或 `de_broadcast send` 广播）→ 对方 `room-join` 加入 → 之后任意成员 `send recipients: [房间id]` 全员同时收到；`room-leave` 退出（最后一人退出自动删房）、`room-rm` 解散（仅创建者）、`room-list` 查我所在的房间。
 - **项目群（project:）**：`send recipients: ['project:/绝对路径']` → 该目录内所有会话可见（按会话 cwd 匹配，跨目录不可见，公告语义保留 30 天）。
 - **默认一对一**：AI 只按用户明确要求使用房间/项目群（工具描述约束，防误扩散）。
@@ -300,30 +301,28 @@ DSH 会话之间传递消息的轻量子功能，**独立于 COI 调度框架**�
 
 ### 标准安装（DSH 08-06+ profiles 架构，推荐）
 
-插件以包形式安装进 profile（`web` / `tui` / `headless` 等），由 profile 的
-`cordis.patch.yml` 组合。以 web profile 为例：
+插件以包形式安装进 profile（`web` / `tui` / `headless` 等）。包内自带
+`cordis.patch.yml`，`dsh plugin add` 安装后 bundle patch 会自动注册 host 行，
+不需要再往 profile patch 里手动 `insert`（重复 insert 同 id 会导致加载器
+报 duplicate loader entry id）：
 
 ```sh
-# 1. 安装到 profile（本地目录用 link:，也可用 git/registry 包地址）
+# 安装到 profile（本地目录用 link:，也可用 git/registry 包地址）
 dsh plugin --profile web add link:/path/to/dsh-memory-evolve
-
-# 2. 在 profile 的 patch 层注册（编辑 ~/.dsh/profiles/web/cordis.patch.yml）：
 ```
+
+如需修改默认配置（如开启回合内记忆审查），在 profile 的 patch 层做 id 覆盖
+（编辑 `~/.dsh/profiles/web/cordis.patch.yml`）：
 
 ```yaml
-- insert:
-    - id: dsh-memory-evolve
-      name: dsh-memory-evolve
-      config:
-        reviewEnabled: true      # 开启回合内记忆审查（默认关）
-        reviewInterval: 10       # 每 10 个用户回合审查一次
+- id: dsh-memory-evolve
+  config:
+    reviewEnabled: true      # 开启回合内记忆审查（默认关）
+    reviewInterval: 10       # 每 10 个用户回合审查一次
 ```
 
-重启 `dsh web` 即生效。卸载：删除 patch 中的 insert 行 + `dsh plugin --profile web remove dsh-memory-evolve`，一切效果随插件卸载自动清理。
-
-> 注意：client bundle 注册 ID 取自 `package.json` 的 `name`，patch 行的
-> `name` 必须与之完全一致（`dsh-memory-evolve`），不要加 `@dsh-local/`
-> 前缀——那是 08-06 之前旧机制的软链命名空间。
+重启 `dsh web` 即生效。卸载：`dsh plugin --profile web remove dsh-memory-evolve`，
+一切效果随插件卸载自动清理。
 
 ### 旧机制（DSH 08-06 之前，不再推荐）
 
@@ -501,7 +500,7 @@ agent 会通过 `memory` 工具读写记忆，通过 `skill_manage` 工具管理
 
 ```
 用户会话进行中（每回合）
-  ├─ 收尾：模型先输出完整回复文本，再在文本之后附带工具调用（先文本后工具）
+  ├─ 收尾分两步：① 单独一条消息只发写入工具调用（不写正文）；② 下一条消息输出完整回复（无工具调用，结束 turn）
   ├─ 写入：memory 工具向 project/daily 各写入 1 条本回合进展；出现重要项目事实（长期约定/决策/架构/踩坑）时另向 key 写入 1 条，没有则跳过
   └─ 检查：模型调用 memory_review_status check 查询审查是否到期
        ├─ 未到期（due=false）→ 正常结束回合

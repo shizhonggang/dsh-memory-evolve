@@ -8,6 +8,41 @@
 
 ---
 
+## 快速开始（安装）
+
+插件包内自带 `cordis.patch.yml`（`dsh.bundle.patch` 声明），`dsh plugin add` 安装后 **host 端自动注册，无需任何手动配置**。以 web profile 为例，两步装好：
+
+```sh
+# 1. 安装到 profile（本地目录用 link:，也可用 git/registry 包地址）
+dsh plugin --profile web add github:csyangwen/dsh-memory-evolve
+
+# 2. 重启 dsh web 即生效
+```
+
+> ⚠️ **不要再往 `~/.dsh/profiles/web/cordis.patch.yml` 手动 insert 本插件**：bundle patch 已自动注册，重复 insert 同 id 会让加载器报 duplicate loader entry id 无法启动。完整说明见 [详细功能说明](README-详细说明.md)「标准安装」章节。
+
+**修改默认配置**（如开启回合内记忆审查）：在 profile 的 `cordis.patch.yml` 用 id 覆盖（顶层写法，非 insert）：
+
+```yaml
+- id: dsh-memory-evolve
+  config:
+    reviewEnabled: true      # 开启回合内记忆审查（默认关）
+    reviewInterval: 10       # 每 10 个用户回合审查一次
+```
+
+**插件异常导致 DSH 无法启动时，临时禁用**（等修复后取消）：同样在 profile 的 `cordis.patch.yml` 加一行即可，无需卸载：
+
+```yaml
+- id: dsh-memory-evolve
+  disabled: true
+```
+
+**从旧版本升级**：若你此前按旧文档手动 insert 过本插件，请删除 profile patch 里的 insert 行（否则与 bundle 自动注册重复）。
+
+卸载：`dsh plugin --profile web remove dsh-memory-evolve`，一切效果随插件卸载自动清理。
+
+---
+
 ## 认识它（30 秒）
 
 装上插件后，打开任意会话，你会多出一排能力标签：**记忆 · 技能 · 待办 · 无限画板 · COI 调度 · 会话广播 · 提示词 · 记忆同步 · 模型设置 · 书签 · 会话评审 · Web UI 设置 · Memory Evolve 设置**。AI 侧则多了一批工具：记忆读写、待办、技能管理、本地文件搜索、会话编排、会话广播、外部 AI 派单、提示词注入、模型查询……

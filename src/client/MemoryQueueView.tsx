@@ -11,6 +11,7 @@
  */
 import { useEffect, useState } from 'react'
 import type { Translate } from '@deepseek-ai/dsh-client-ui-slots'
+import { RUNTIME_CONFIG_CHANGED } from './todo-tab-lifecycle.js'
 
 /** Which feature sub-tab is active. */
 export type MemoryFeature = 'guide' | 'suggestions' | 'todo-suggestions' | 'skills' | 'config'
@@ -26,10 +27,10 @@ export interface MemoryQueueViewProps {
 /** 待办建议 target 的展示名（todo-life → 待办·生活）。 */
 function todoTargetLabel(t: Translate, target: string): string {
   const track = target.slice(5)
-  if (track === 'life') return `待办·${t('todo.track.life')}`
-  if (track === 'work') return `待办·${t('todo.track.work')}`
-  if (track === 'project') return `待办·${t('todo.track.project')}`
-  if (track === 'daily') return `待办·${t('todo.track.daily')}`
+  if (track === 'life') return `${isEn() ? 'Todo' : '待办'}·${t('todo.track.life')}`
+  if (track === 'work') return `${isEn() ? 'Todo' : '待办'}·${t('todo.track.work')}`
+  if (track === 'project') return `${isEn() ? 'Todo' : '待办'}·${t('todo.track.project')}`
+  if (track === 'daily') return `${isEn() ? 'Todo' : '待办'}·${t('todo.track.daily')}`
   return target
 }
 
@@ -114,6 +115,8 @@ interface RuntimeConfig {
   uiSettingsEnabled: boolean
   /** 会话书签（独立子模块，默认关）。 */
   bookmarkEnabled: boolean
+  /** 待办能力（默认开；关闭时 dtodo 工具、待办 Tab、到期提醒一并退出，数据保留）。 */
+  todoEnabled: boolean
   /** 渠道通知（de_notify，独立子模块，默认关）：AI 完成任务后经 IM 渠道主动发通知。 */
   notifyEnabled: boolean
   /** 项目记忆跨设备同步（/memory_sync，独立子模块，默认关）：Git 对账。 */
@@ -122,6 +125,17 @@ interface RuntimeConfig {
   advisorEnabled: boolean
   /** 无限画板（独立子模块，默认关）：素材集中台 + de_canvas 双向。 */
   canvasEnabled: boolean
+  /** key 轨渐进式披露模式：auto（小数据量全量/大数据量摘要）/ off（始终全量）/ on（始终摘要）。 */
+  keyProgressiveDisclosure: 'auto' | 'off' | 'on'
+  /** auto 模式下条目数阈值：条目数 ≤ 此值时全量注入。 */
+  keyFullInjectThreshold: number
+  /** auto 模式下字符数阈值：总字符数 ≤ 此值时全量注入。 */
+  keyFullInjectCharLimit: number
+  /** 记忆写入看门狗（用户拍板 2026-09-04：默认关——根源是模型指令遵循
+   *  能力，强模型不需要；打开后连续 N 轮未写 daily/project 快照会置顶提醒）。 */
+  perTurnWriteGuard: boolean
+  /** 看门狗触发阈值：连续 N 轮未写入即提醒（>=1 整数）。 */
+  writeGuardThreshold: number
 }
 
 /** One fetch helper against the node half's API prefix. */
@@ -139,8 +153,8 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
 
 /** Summarize an approve/reject report into one line. */
 function summarizeReport(report: { lines?: string[]; removed?: number; remaining: number }): string {
-  const head = report.lines?.join('；') ?? `已处理 ${report.removed ?? 0} 条`
-  return `${head}（剩余 ${report.remaining} 条）`
+  const head = report.lines?.join(isEn() ? '; ' : '；') ?? (isEn() ? `${report.removed ?? 0} handled` : `已处理 ${report.removed ?? 0} 条`)
+  return isEn() ? `${head} (${report.remaining} remaining)` : `${head}（剩余 ${report.remaining} 条）`
 }
 
 /** Display-side formatting of the ISO timestamp; falls back to the raw string. */
@@ -151,6 +165,9 @@ function formatTime(iso: string): string {
 }
 
 /** The three feature panels (suggestions / skills / config). */
+/** English browser → English inline text. */
+const isEn = (): boolean => typeof navigator !== 'undefined' && navigator.language?.toLowerCase().startsWith('en')
+
 export function MemoryQueueView(props: MemoryQueueViewProps): JSX.Element {
   const { t, feature, onChanged } = props
   const [entries, setEntries] = useState<SuggestionRow[] | null>(null)
@@ -252,6 +269,8 @@ export function MemoryQueueView(props: MemoryQueueViewProps): JSX.Element {
       perTurnProjectWrites: draft.perTurnProjectWrites,
       perTurnDailyWrites: draft.perTurnDailyWrites,
       perTurnKeyWrites: draft.perTurnKeyWrites,
+      perTurnWriteGuard: draft.perTurnWriteGuard,
+      writeGuardThreshold: draft.writeGuardThreshold,
       searchDocsEnabled: draft.searchDocsEnabled,
       searchDocsMode: draft.searchDocsMode,
       coiEnabled: draft.coiEnabled,
@@ -263,9 +282,13 @@ export function MemoryQueueView(props: MemoryQueueViewProps): JSX.Element {
       modelsEnabled: draft.modelsEnabled,
       uiSettingsEnabled: draft.uiSettingsEnabled,
       bookmarkEnabled: draft.bookmarkEnabled,
+      todoEnabled: draft.todoEnabled,
       notifyEnabled: draft.notifyEnabled,
       syncEnabled: draft.syncEnabled,
       canvasEnabled: draft.canvasEnabled,
+      keyProgressiveDisclosure: draft.keyProgressiveDisclosure,
+      keyFullInjectThreshold: draft.keyFullInjectThreshold,
+      keyFullInjectCharLimit: draft.keyFullInjectCharLimit,
     }
     void api<{ config: RuntimeConfig }>('/api/config', {
       method: 'POST',
@@ -273,6 +296,9 @@ export function MemoryQueueView(props: MemoryQueueViewProps): JSX.Element {
     }).then((res) => {
       setConfig(res.config)
       setDraft(res.config)
+      // 配置保存成功后广播运行时配置变更事件：待办 Tab 生命周期监听它，
+      // 关闭 todoEnabled 时立即隐藏 Tab、重新启用时恢复（见 index.ts apply）。
+      window.dispatchEvent(new CustomEvent(RUNTIME_CONFIG_CHANGED, { detail: res.config }))
       setNotice({ kind: 'ok', text: t('panel.config.saved') })
     }).catch((error: Error) => {
       setNotice({ kind: 'error', text: t('panel.config.failed', { message: error.message }) })
@@ -407,6 +433,13 @@ export function MemoryQueueView(props: MemoryQueueViewProps): JSX.Element {
               <span className="me-guide-body">
                 <strong>{t('panel.guide.canvas.title')}</strong>
                 <span>{t('panel.guide.canvas.desc')}</span>
+              </span>
+            </div>
+            <div className="me-guide-row">
+              <span className="me-guide-icon">🔁</span>
+              <span className="me-guide-body">
+                <strong>{t('panel.guide.sync.title')}</strong>
+                <span>{t('panel.guide.sync.desc')}</span>
               </span>
             </div>
             <div className="me-guide-row">
@@ -647,6 +680,38 @@ export function MemoryQueueView(props: MemoryQueueViewProps): JSX.Element {
                     onChange={(event) => patchDraft({ skillReviewEnabled: event.target.checked })}
                   />
                 </label>
+                {/* 记忆写入看门狗（PR #37，用户拍板 2026-09-04：默认关——
+                    根源是模型指令遵循能力，强模型不需要；打开后连续 N 轮
+                    未写 daily/project 快照置顶提醒，写入即消）。 */}
+                <label className="me-field">
+                  <span className="me-field-label">
+                    {t('panel.config.perTurnWriteGuard')}
+                    <em className="me-field-hint">{t('panel.config.perTurnWriteGuard.hint')}</em>
+                  </span>
+                  <input
+                    type="checkbox"
+                    className="me-switch"
+                    checked={draft.perTurnWriteGuard}
+                    onChange={(event) => patchDraft({ perTurnWriteGuard: event.target.checked })}
+                  />
+                </label>
+                <label className="me-field">
+                  <span className="me-field-label">
+                    {t('panel.config.writeGuardThreshold')}
+                    <em className="me-field-hint">{t('panel.config.writeGuardThreshold.hint')}</em>
+                  </span>
+                  <input
+                    type="number"
+                    className="me-input"
+                    min={1}
+                    value={draft.writeGuardThreshold}
+                    onChange={(event) => {
+                      // 与 keyFullInjectThreshold 同款 clamp：清空/小数/0 → 1
+                      const n = Number(event.target.value)
+                      patchDraft({ writeGuardThreshold: Number.isFinite(n) && n >= 1 ? Math.floor(n) : 1 })
+                    }}
+                  />
+                </label>
               </div>
               <div className="me-group">
                 <label className="me-field">
@@ -683,6 +748,60 @@ export function MemoryQueueView(props: MemoryQueueViewProps): JSX.Element {
                     className="me-switch"
                     checked={draft.perTurnKeyWrites}
                     onChange={(event) => patchDraft({ perTurnKeyWrites: event.target.checked })}
+                  />
+                </label>
+              </div>
+              {/* key 轨渐进式披露配置组 */}
+              <div className="me-group">
+                <label className="me-field">
+                  <span className="me-field-label">
+                    {t('panel.config.keyProgressiveDisclosure')}
+                    <em className="me-field-hint">{t('panel.config.keyProgressiveDisclosure.hint')}</em>
+                  </span>
+                  <select
+                    className="me-todo-select"
+                    value={draft.keyProgressiveDisclosure ?? 'off'}
+                    onChange={(event) => patchDraft({ keyProgressiveDisclosure: event.target.value })}
+                  >
+                    <option value="auto">{t('panel.config.keyProgressiveDisclosure.auto')}</option>
+                    <option value="off">{t('panel.config.keyProgressiveDisclosure.off')}</option>
+                    <option value="on">{t('panel.config.keyProgressiveDisclosure.on')}</option>
+                  </select>
+                </label>
+                <label className="me-field">
+                  <span className="me-field-label">
+                    {t('panel.config.keyFullInjectThreshold')}
+                    <em className="me-field-hint">{t('panel.config.keyFullInjectThreshold.hint')}</em>
+                  </span>
+                  <input
+                    type="number"
+                    className="me-input"
+                    min={1}
+                    value={draft.keyFullInjectThreshold ?? 3}
+                    onChange={(event) => {
+                      // 审查修复：清空输入框 Number('')=0 会违反服务端 value<1
+                      // 校验（保存必失败）——clamp 到最小值 1。
+                      const n = Number(event.target.value)
+                      patchDraft({ keyFullInjectThreshold: Number.isFinite(n) && n >= 1 ? Math.floor(n) : 1 })
+                    }}
+                  />
+                </label>
+                <label className="me-field">
+                  <span className="me-field-label">
+                    {t('panel.config.keyFullInjectCharLimit')}
+                    <em className="me-field-hint">{t('panel.config.keyFullInjectCharLimit.hint')}</em>
+                  </span>
+                  <input
+                    type="number"
+                    className="me-input"
+                    min={100}
+                    value={draft.keyFullInjectCharLimit ?? 1500}
+                    onChange={(event) => {
+                      // 审查修复：清空输入框 Number('')=0 违反 min:100 与服务端
+                      // 正整数校验——clamp 到最小值 100。
+                      const n = Number(event.target.value)
+                      patchDraft({ keyFullInjectCharLimit: Number.isFinite(n) && n >= 100 ? Math.floor(n) : 100 })
+                    }}
                   />
                 </label>
               </div>
@@ -853,6 +972,18 @@ export function MemoryQueueView(props: MemoryQueueViewProps): JSX.Element {
                     className="me-switch"
                     checked={draft.bookmarkEnabled}
                     onChange={(event) => patchDraft({ bookmarkEnabled: event.target.checked })}
+                  />
+                </label>
+                <label className="me-field">
+                  <span className="me-field-label">
+                    {t('panel.config.todoEnabled')}
+                    <em className="me-field-hint">{t('panel.config.todoEnabled.hint')}</em>
+                  </span>
+                  <input
+                    type="checkbox"
+                    className="me-switch"
+                    checked={draft.todoEnabled}
+                    onChange={(event) => patchDraft({ todoEnabled: event.target.checked })}
                   />
                 </label>
               </div>

@@ -5,7 +5,7 @@
  * createPortal 到 document.body，从而避开会话子树可能形成的 containing block。
  * AdvisorPanel 只负责五区 UI；数据与副作用全部由 advisor-store.ts 管理。
  */
-import { Component, useEffect, useMemo, useRef, useState, type KeyboardEvent, type ReactNode } from 'react'
+import { Component, useEffect, useMemo, useRef, useState, type KeyboardEvent, type PointerEvent as ReactPointerEvent, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
 import type { PropsRuntime, Translate } from '@deepseek-ai/dsh-client-ui-slots'
 import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
@@ -36,25 +36,49 @@ export interface AdvisorPanelProps {
 
 type PanelTab = 'scopes' | 'live' | 'history' | 'settings'
 
+/**
+ * 悬浮胶囊位置持久化键（2026-08-17 issue #11 评论反馈：位置写死不可调）。
+ * 2026-08-17 用户拍板：胶囊**只能吸附右边缘**、沿最右边上下移动（不允许
+ * 拖到页面中间）——因此只持久化 top（垂直位置），水平方向固定贴右
+ * （CSS right: 0），拖动时不做任何水平位移。清除键值/删除 key 即回默认
+ * 位置（top 42%）。
+ */
+const CAPSULE_POS_KEY = 'dsh-memory-evolve:advisor-capsule-pos'
+
+/** 单次指针会话的拖拽状态：记录起点用于区分"点击"与"拖拽"。 */
+interface CapsuleDragState {
+  pointerId: number
+  startX: number
+  startY: number
+  /** 位移是否已超过阈值（4px）：超过才算拖拽，松手时才会持久化并抑制点击 */
+  dragged: boolean
+}
+
+/** English browser → English panel labels; anything else keeps Chinese. */
+const isEn = (): boolean => typeof navigator !== 'undefined' && navigator.language?.toLowerCase().startsWith('en')
+
 const STATUS_META: Record<AdvisorRuntimeStatus, { icon: string; label: string; cls: string }> = {
-  disabled: { icon: '✖', label: '已停用', cls: 'advisor-status-disabled' },
-  idle: { icon: '●', label: '空闲', cls: 'advisor-status-idle' },
-  reviewing: { icon: '◐', label: '评审中', cls: 'advisor-status-reviewing' },
-  quota_exhausted: { icon: '⏸', label: '已暂停', cls: 'advisor-status-paused' },
-  halted: { icon: '⚠', label: '已终止', cls: 'advisor-status-halted' },
+  get disabled() { return { icon: '✖', label: isEn() ? 'Disabled' : '已停用', cls: 'advisor-status-disabled' } },
+  get idle() { return { icon: '●', label: isEn() ? 'Idle' : '空闲', cls: 'advisor-status-idle' } },
+  get reviewing() { return { icon: '◐', label: isEn() ? 'Reviewing' : '评审中', cls: 'advisor-status-reviewing' } },
+  get quota_exhausted() { return { icon: '⏸', label: isEn() ? 'Paused' : '已暂停', cls: 'advisor-status-paused' } },
+  get halted() { return { icon: '⚠', label: isEn() ? 'Halted' : '已终止', cls: 'advisor-status-halted' } },
 }
 
 const SEVERITY_META: Record<AdvisorNoteSeverity, { label: string; cls: string }> = {
   // Q1：info 最低等级（默认仅记录不注入，面板照常展示）
-  info: { label: 'info · 记录', cls: 'advisor-severity-info' },
-  nit: { label: 'nit · 建议', cls: 'advisor-severity-nit' },
-  concern: { label: 'concern · 关注', cls: 'advisor-severity-concern' },
-  blocker: { label: 'blocker · 阻断', cls: 'advisor-severity-blocker' },
+  info: { get label() { return isEn() ? 'info · note' : 'info · 记录' }, cls: 'advisor-severity-info' },
+  nit: { get label() { return isEn() ? 'nit · suggestion' : 'nit · 建议' }, cls: 'advisor-severity-nit' },
+  concern: { get label() { return isEn() ? 'concern · watch' : 'concern · 关注' }, cls: 'advisor-severity-concern' },
+  blocker: { get label() { return isEn() ? 'blocker · blocking' : 'blocker · 阻断' }, cls: 'advisor-severity-blocker' },
   // Q4：问答回复（用户提问的直接回答，非评审建议）
-  answer: { label: '回答', cls: 'advisor-severity-answer' },
+  answer: { get label() { return isEn() ? 'answer' : '回答' }, cls: 'advisor-severity-answer' },
 }
 
-const OUTCOME_LABEL = {
+function outcomeLabel(outcome: keyof typeof OUTCOME_ZH): string {
+  return isEn() ? OUTCOME_EN[outcome] : OUTCOME_ZH[outcome]
+}
+const OUTCOME_ZH = {
   delivered: '已送达',
   // Q1：info 级默认仅记录（事件照发、面板可见，会话流不受打扰）
   recorded: '已记录',
@@ -65,6 +89,16 @@ const OUTCOME_LABEL = {
   dropped: '已丢弃',
   failed: '评审失败',
   cancelled: '已取消',
+} as const
+const OUTCOME_EN = {
+  delivered: 'Delivered',
+  recorded: 'Recorded',
+  answered: 'Answered',
+  suppressed: 'Suppressed',
+  'no-note': 'No note',
+  dropped: 'Dropped',
+  failed: 'Review failed',
+  cancelled: 'Cancelled',
 } as const
 
 function pad2(value: number): string {
@@ -124,6 +158,98 @@ export function AdvisorHost(props: AdvisorHostProps): JSX.Element {
   const [userToggled, setUserToggled] = useState(false)
   const preferredExpanded = useRef(true)
   const manuallyExpanded = useRef(false)
+
+  // ---- 悬浮胶囊拖拽（2026-08-17 issue #11 评论反馈；用户拍板吸附右边缘） ----
+  // capsuleTop：null = 未拖过（用 CSS 默认 top 42%）；否则存垂直位置 top
+  // （水平固定贴右边缘 right: 0，不允许拖到页面中间——用户 2026-08-17 拍板）。
+  // capsuleTopRef 同步镜像最新值：pointerup 持久化时 state 可能尚未
+  // flush，读 ref 保证拿到最后一次 move 的位置。
+  const [capsuleTop, setCapsuleTop] = useState<number | null>(null)
+  const capsuleTopRef = useRef<number | null>(null)
+  const capsuleDragRef = useRef<CapsuleDragState | null>(null)
+  /** 拖拽刚结束的标记：click 事件在 pointerup 之后触发，用它抑制"拖拽完
+   *  误触展开面板"（React 的 onClick 无法直接取消，只能检查标记后跳过）。 */
+  const capsuleDraggedRef = useRef(false)
+  const [capsuleDragging, setCapsuleDragging] = useState(false)
+  const capsuleRef = useRef<HTMLButtonElement | null>(null)
+
+  // 初始化：从 localStorage 恢复上次拖拽的垂直位置（数据损坏/不可用则
+  // 静默用默认位置）。兼容首版 {x, y} 旧数据：只取 y（x 无意义，水平
+  // 固定贴右），新版只存 {top}。
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    try {
+      const raw = window.localStorage.getItem(CAPSULE_POS_KEY)
+      if (raw === null) return
+      const parsed = JSON.parse(raw) as { top?: unknown; y?: unknown }
+      const top = typeof parsed.top === 'number' && Number.isFinite(parsed.top)
+        ? parsed.top
+        : (typeof parsed.y === 'number' && Number.isFinite(parsed.y) ? parsed.y : null)
+      if (top !== null) {
+        capsuleTopRef.current = top
+        setCapsuleTop(top)
+      }
+    } catch {
+      // localStorage 不可用或数据损坏：静默回退默认位置
+    }
+  }, [])
+
+  // 拖拽开始：记录起点并捕获指针（指针移出按钮后 move/up 仍派发到按钮）
+  const onCapsulePointerDown = (event: ReactPointerEvent<HTMLButtonElement>): void => {
+    // 鼠标只响应左键；触屏/笔第一触点 button 恒为 0，不额外过滤
+    if (event.pointerType === 'mouse' && event.button !== 0) return
+    capsuleDragRef.current = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      dragged: false,
+    }
+    try { event.currentTarget.setPointerCapture(event.pointerId) } catch { /* 捕获失败不阻塞 */ }
+    // 阻止拖拽中触发原生行为（文本选择/图片拖拽等）
+    event.preventDefault()
+  }
+
+  const onCapsulePointerMove = (event: ReactPointerEvent<HTMLButtonElement>): void => {
+    const drag = capsuleDragRef.current
+    if (drag === null || drag.pointerId !== event.pointerId) return
+    const dx = event.clientX - drag.startX
+    const dy = event.clientY - drag.startY
+    // 位移未超过 4px 视为纯点击（可能微抖），不移动也不进入拖拽态
+    if (!drag.dragged && Math.hypot(dx, dy) < 4) return
+    drag.dragged = true
+    if (!capsuleDragging) setCapsuleDragging(true)
+    const height = event.currentTarget.offsetHeight
+    // 吸附右边缘：只取垂直位移（水平一律贴右，right: 0 由 CSS 保证），
+    // clamp 到视口内，禁止拖出屏幕上下缘导致拿不回来
+    const top = Math.min(Math.max(0, event.clientY - height / 2), window.innerHeight - height)
+    capsuleTopRef.current = top
+    setCapsuleTop(top)
+  }
+
+  // 拖拽结束：释放指针捕获；拖过 → 标记供 click 抑制 + 持久化位置
+  const finishCapsuleDrag = (event: ReactPointerEvent<HTMLButtonElement>): void => {
+    const drag = capsuleDragRef.current
+    if (drag === null || drag.pointerId !== event.pointerId) return
+    capsuleDragRef.current = null
+    setCapsuleDragging(false)
+    try { event.currentTarget.releasePointerCapture(event.pointerId) } catch { /* 已释放则忽略 */ }
+    if (drag.dragged) {
+      capsuleDraggedRef.current = true
+      const top = capsuleTopRef.current
+      if (top !== null) {
+        try { window.localStorage.setItem(CAPSULE_POS_KEY, JSON.stringify({ top })) } catch { /* 存储失败静默 */ }
+      }
+    }
+  }
+
+  // 点击展开面板；拖拽刚结束（pointerup 后触发的 click）直接跳过
+  const onCapsuleClick = (): void => {
+    if (capsuleDraggedRef.current) {
+      capsuleDraggedRef.current = false
+      return
+    }
+    toggle()
+  }
 
   const panelEnabled = snapshot.config?.advisorPanelEnabled
     ?? snapshot.status?.panelEnabled
@@ -217,10 +343,16 @@ export function AdvisorHost(props: AdvisorHostProps): JSX.Element {
       // 而非用「显不显示」表达。
       <button
         type="button"
-        className={`advisor-capsule ${capsuleStateClass}`}
-        onClick={toggle}
+        ref={capsuleRef}
+        className={`advisor-capsule ${capsuleStateClass}${capsuleDragging ? ' advisor-capsule-dragging' : ''}`}
+        style={capsuleTop !== null ? { top: capsuleTop } : undefined}
+        onClick={onCapsuleClick}
+        onPointerDown={onCapsulePointerDown}
+        onPointerMove={onCapsulePointerMove}
+        onPointerUp={finishCapsuleDrag}
+        onPointerCancel={finishCapsuleDrag}
         aria-label="展开会话评审面板"
-        title="展开会话评审面板"
+        title="展开会话评审面板（按住可沿右边缘上下拖动）"
       >
         <span className="advisor-capsule-icon" aria-hidden="true">◉</span>
         <span className="advisor-capsule-label">Advisor</span>
@@ -711,7 +843,7 @@ function ReviewCard(props: {
         {terminal !== null && <span>{formatElapsed(terminal.elapsedMs)}</span>}
         {terminal?.delivery === 'steer' && <span className="advisor-delivery">已送达 ✓</span>}
         {terminal?.delivery === 'inject' && <span className="advisor-delivery">已注入 ✓</span>}
-        {terminal !== null && terminal.delivery === null && <span>{OUTCOME_LABEL[terminal.outcome]}</span>}
+        {terminal !== null && terminal.delivery === null && <span>{outcomeLabel(terminal.outcome)}</span>}
       </div>
 
       {identity !== null && <div className="advisor-record-owner" title={identity}>{identity}</div>}
@@ -761,7 +893,7 @@ function ReviewCard(props: {
           {note.text}
         </div>
       ) : (
-        <div className="advisor-outcome-empty">{OUTCOME_LABEL[terminal.outcome]}</div>
+        <div className="advisor-outcome-empty">{outcomeLabel(terminal.outcome)}</div>
       )}
 
       {terminal?.error !== null && terminal?.error !== undefined && (

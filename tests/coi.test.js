@@ -17,8 +17,13 @@ import { BroadcastStore, messageToolDefinition } from '../lib/coi/broadcast.js'
 import { coiToolDefinitions } from '../lib/coi/tools.js'
 import { installCoiApi } from '../lib/coi/api.js'
 import { validateCoiRuntimePatch } from '../lib/coi/index.js'
+import { PLUGIN_SOURCE_KIND } from '../lib/coi/source.js'
 import { buildMemoryContext, resolveConfig, renderSnapshot } from '../lib/index.js'
 import { MemoryStore } from '../lib/store.js'
+
+// This suite pins the legacy Chinese output contract; i18n.test.js covers English.
+import { setLocale } from '../lib/i18n.js'
+setLocale('zh')
 
 /** 所有测试创建的调度器：统一 dispose，避免 flush 定时器挂住事件循环。 */
 const schedulers = []
@@ -613,7 +618,7 @@ test('skills sync: version-gated copy protects user edits', async () => {
   mkdirSync(join(pluginSkills, 'kimi-cli-calling'), { recursive: true })
   writeFileSync(join(pluginSkills, 'kimi-cli-calling', 'SKILL.md'), '---\nx-version: 1\n---\n# kimi v1\n')
   const { syncBuiltinSkills, BUILTIN_SKILLS } = await import('../lib/coi/skills-sync.js')
-  assert.deepEqual(BUILTIN_SKILLS, ['kimi-cli-calling', 'codex-cli-calling', 'grok-cli-calling', 'hermes-cli-calling'])
+  assert.deepEqual(BUILTIN_SKILLS, ['kimi-cli-calling', 'codex-cli-calling', 'grok-cli-calling', 'hermes-cli-calling', 'memory-consolidate'])
   const results = syncBuiltinSkills(pluginSkills, userSkills)
   assert.equal(results.find((r) => r.name === 'kimi-cli-calling').action, 'synced')
   assert.equal(results.find((r) => r.name === 'codex-cli-calling').action, 'missing')
@@ -630,6 +635,34 @@ test('skills sync: version-gated copy protects user edits', async () => {
   const upgraded = syncBuiltinSkills(pluginSkills, userSkills)
   assert.equal(upgraded.find((r) => r.name === 'kimi-cli-calling').action, 'synced')
   assert.equal(readFileSync(join(userSkills, 'kimi-cli-calling', 'SKILL.md'), 'utf8').includes('# kimi v2'), true)
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('skills sync: directory skills (scripts/) copy as a whole folder', async () => {
+  const dir = tempDir()
+  const pluginSkills = join(dir, 'plugin-skills')
+  const userSkills = join(dir, 'user-skills')
+  mkdirSync(join(pluginSkills, 'memory-consolidate', 'scripts'), { recursive: true })
+  writeFileSync(join(pluginSkills, 'memory-consolidate', 'SKILL.md'), '---\nname: memory-consolidate\nx-version: 1\ndescription: 记忆合并梳理\n---\n# v1\n')
+  writeFileSync(join(pluginSkills, 'memory-consolidate', 'scripts', 'scan_memory.mjs'), 'export const v = 1\n')
+  const { syncBuiltinSkills } = await import('../lib/coi/skills-sync.js')
+  // 首次同步：SKILL.md 与 scripts/ 辅助文件一起落地
+  const first = syncBuiltinSkills(pluginSkills, userSkills)
+  assert.equal(first.find((r) => r.name === 'memory-consolidate').action, 'synced')
+  assert.equal(readFileSync(join(userSkills, 'memory-consolidate', 'scripts', 'scan_memory.mjs'), 'utf8'), 'export const v = 1\n')
+  // 版本不变 → 用户编辑受保护
+  writeFileSync(join(userSkills, 'memory-consolidate', 'SKILL.md'), '---\nx-version: 1\n---\n# 用户改过\n')
+  const again = syncBuiltinSkills(pluginSkills, userSkills)
+  assert.equal(again.find((r) => r.name === 'memory-consolidate').action, 'unchanged')
+  assert.equal(readFileSync(join(userSkills, 'memory-consolidate', 'SKILL.md'), 'utf8').includes('用户改过'), true)
+  // 版本升级 → 整目录覆盖，且目标里的陈旧辅助文件被清掉
+  writeFileSync(join(pluginSkills, 'memory-consolidate', 'SKILL.md'), '---\nname: memory-consolidate\nx-version: 2\ndescription: 记忆合并梳理\n---\n# v2\n')
+  writeFileSync(join(userSkills, 'memory-consolidate', 'scripts', 'stale-old.mjs'), 'export const stale = true\n')
+  const bump = syncBuiltinSkills(pluginSkills, userSkills)
+  assert.equal(bump.find((r) => r.name === 'memory-consolidate').action, 'synced')
+  assert.equal(readFileSync(join(userSkills, 'memory-consolidate', 'SKILL.md'), 'utf8').includes('# v2'), true)
+  assert.equal(existsSync(join(userSkills, 'memory-consolidate', 'scripts', 'stale-old.mjs')), false)
+  assert.equal(readFileSync(join(userSkills, 'memory-consolidate', 'scripts', 'scan_memory.mjs'), 'utf8'), 'export const v = 1\n')
   rmSync(dir, { recursive: true, force: true })
 })
 
@@ -748,7 +781,10 @@ test('wakeOnComplete: idle owner gets followup (完成唤醒), 消息无摘要�
   // 2026-08-13 用户拍板：完成消息不携带输出摘要截取，直接给日志文件路径
   assert.ok(!message.content[0].text.includes('摘要：'), '消息不得携带摘要截取')
   assert.match(message.content[0].text, /日志文件/, '消息必须给出完整日志文件路径')
-  assert.equal(message.source.kind, 'plugin')
+  // v4 会话格式：kind 必须是 producer-owned 的 `plugin:<包名>`，且不得带
+  // plugin 字段（带旧字段的注入会让接收方那一轮整轮失败，见 tests/injection-source-kind.test.js）
+  assert.equal(message.source.kind, PLUGIN_SOURCE_KIND)
+  assert.equal(message.source.plugin, undefined, 'v4 起不得再带 plugin 字段')
   assert.equal(message.source.form, 'notice')
   assert.equal(typeof message.id, 'string')
   rmSync(dir, { recursive: true, force: true })
@@ -1399,6 +1435,9 @@ test('installBroadcast: 成员状态变化 → 向同房其他成员投递独立
   assert.equal(aInjects.length, 1, 'sA 收到房间动态消息')
   assert.ok(aInjects[0].content[0].text.includes('【房间动态】'), '动态消息格式')
   assert.ok(aInjects[0].content[0].text.includes('开始干活'), 'running 语义')
+  // 房间动态也走 deliver()：v4 注入 kind 必须是 producer-owned 的 `plugin:<包名>`
+  assert.equal(aInjects[0].source.kind, PLUGIN_SOURCE_KIND)
+  assert.equal(aInjects[0].source.plugin, undefined, 'v4 起不得再带 plugin 字段')
   assert.equal(bInjects.length, 0, '变化者自己不收自己的动态')
   // 不再写 dynamics 队列（快照消费已移除，2026-08-13）
   assert.ok(!existsSync(join(dir, 'bcast', 'dynamics.json')), '不再写动态队列文件')
@@ -1429,10 +1468,123 @@ test('installBroadcast: 新广播消息 → 向接收方投递独立消息（收
   assert.ok(text.includes('【广播消息】'), '广播消息格式')
   assert.ok(text.includes('进度同步'), '含主题')
   assert.ok(text.includes(`de_broadcast read ${sent.item.id}`), '引导 read 处理（收件箱语义不变）')
+  // 广播投递是最高频的注入路径：kind 必须是 producer-owned 的 `plugin:<包名>`
+  assert.equal(bInjects[0].source.kind, PLUGIN_SOURCE_KIND)
+  assert.equal(bInjects[0].source.plugin, undefined, 'v4 起不得再带 plugin 字段')
+  assert.equal(bInjects[0].source.form, 'notice')
   // 未读仍在收件箱（通知 ≠ 已读）
   assert.equal(installed.store.unreadCount('sB'), 1, '通知后未读计数不变（仍需 read）')
   // 发送者自己不收
   assert.equal(bInjects.length, 1)
+  installed.dispose()
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('installBroadcast: send wake=true 唤醒 idle 接收方（running 仍 inject、离线跳过）', async () => {
+  const dir = tempDir()
+  const { ctx } = fakeCtx()
+  const { installBroadcast } = await import('../lib/coi/index.js')
+  // 假 agents 服务：sB=idle、sC=running、sD 离线（get 返回 null）
+  const bFollowups = []
+  const bInjects = []
+  const cFollowups = []
+  const cInjects = []
+  ctx.get = (name) => (name === 'agents'
+    ? {
+        get: (sid) => (sid === 'sB'
+          ? { status: 'idle', followup: (m) => bFollowups.push(m), inject: (m) => bInjects.push(m) }
+          : sid === 'sC'
+            ? { status: 'running', followup: (m) => cFollowups.push(m), inject: (m) => cInjects.push(m) }
+            : null),
+      }
+    : undefined)
+  const installed = installBroadcast(ctx, { memoryDir: dir, broadcastDataDir: join(dir, 'bcast') })
+  // wake=true：sB（idle）→ followup 唤醒（消息带唤醒标记）；sC（running）→
+  // inject 同回合可见不打断；sD（离线）→ 跳过但消息留在收件箱
+  const sent = installed.store.send({ sender: 'sA', recipients: ['sB', 'sC', 'sD'], content: '急事：立即处理', subject: '唤醒测试', wake: true })
+  assert.equal(sent.ok, true)
+  assert.equal(sent.woken, 1, '只有 idle 的 sB 被唤醒')
+  assert.equal(bFollowups.length, 1, 'sB 收到 followup（唤醒开新回合）')
+  assert.ok(bFollowups[0].content[0].text.includes('发送方唤醒了你'), '唤醒消息带标记')
+  assert.equal(bInjects.length, 0, 'sB 不走 inject')
+  assert.equal(cFollowups.length, 0, 'running 的 sC 不 followup（不打断进行中的回合）')
+  assert.equal(cInjects.length, 1, 'sC 走 inject（同回合可见）')
+  assert.equal(installed.store.unreadCount('sD'), 1, '离线 sD 消息仍在收件箱')
+  // wake 缺省 false：全部 inject，不唤醒（原有行为不变）
+  const sent2 = installed.store.send({ sender: 'sA', recipients: ['sB'], content: '普通消息', subject: '不唤醒' })
+  assert.equal(sent2.ok, true)
+  assert.equal(sent2.woken, 0)
+  assert.equal(bFollowups.length, 1, '没有新 followup')
+  assert.equal(bInjects.length, 1, 'sB 走 inject')
+  installed.dispose()
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('installBroadcast: wake 回执零唤醒也报数；单点失败不中断；重复接收方去重', async () => {
+  const dir = tempDir()
+  const { ctx } = fakeCtx()
+  const { installBroadcast } = await import('../lib/coi/index.js')
+  const delivered = [] // 成功投递的接收方（followup/inject 落地）
+  const attempts = [] // 每个接收方的投递尝试（进 followup/inject 即记，含抛错）
+  ctx.get = (name) => (name === 'agents'
+    ? {
+        get: (sid) => {
+          if (sid === 'sB') {
+            // sB 始终抛错：验证单点失败不影响其他接收方（P2-2）
+            return {
+              status: 'idle',
+              followup: () => { attempts.push('sB'); throw new Error('boom') },
+              inject: () => { attempts.push('sB'); delivered.push('sB-inject') },
+            }
+          }
+          if (sid === 'sC') {
+            return {
+              status: 'idle',
+              followup: () => { attempts.push('sC'); delivered.push('sC') },
+              inject: () => { attempts.push('sC'); delivered.push('sC-inject') },
+            }
+          }
+          return null
+        },
+      }
+    : undefined)
+  const installed = installBroadcast(ctx, { memoryDir: dir, broadcastDataDir: join(dir, 'bcast') })
+  // P2-2a：重复接收方（['sB','sB']）去重——只投递一次（虽然投递抛错被隔离）
+  const dedup = installed.store.send({ sender: 'sA', recipients: ['sB', 'sB'], content: 'x', subject: '去重', wake: true })
+  assert.equal(dedup.ok, true)
+  assert.equal(attempts.length, 1, '重复接收方只投递一次')
+  // P2-2b：sB 抛错被独立捕获，sC 正常唤醒；woken 只计成功的
+  const isolated = installed.store.send({ sender: 'sA', recipients: ['sB', 'sC'], content: 'y', subject: '失败隔离', wake: true })
+  assert.equal(isolated.ok, true)
+  assert.equal(isolated.woken, 1, 'sC 被唤醒；sB 抛错被隔离')
+  assert.ok(delivered.includes('sC'), 'sC 收到 followup')
+  // 全部离线 → wake 回执 woken=0（工具层仍会报「已唤醒 0 个」，P1-6）
+  const none = installed.store.send({ sender: 'sA', recipients: ['sD'], content: 'z', subject: '零唤醒', wake: true })
+  assert.equal(none.ok, true)
+  assert.equal(none.woken, 0)
+  installed.dispose()
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('de_broadcast 工具 send：wake 参数穿透投递链，回执含唤醒计数', async () => {
+  const dir = tempDir()
+  const { ctx, registered } = fakeCtx()
+  const { installBroadcast } = await import('../lib/coi/index.js')
+  const bFollowups = []
+  ctx.get = (name) => (name === 'agents'
+    ? { get: (sid) => (sid === 'sB' ? { status: 'idle', followup: (m) => bFollowups.push(m), inject: () => {} } : null) }
+    : undefined)
+  const installed = installBroadcast(ctx, { memoryDir: dir, broadcastDataDir: join(dir, 'bcast') })
+  const tool = registered.tools.find((t) => t.name === 'de_broadcast')
+  assert.ok(tool, 'de_broadcast 已注册')
+  assert.ok(tool.parameters.properties.wake, '工具 schema 含 wake 参数')
+  const result = await tool.execute(
+    { action: 'send', recipients: ['sB'], content: '工具层唤醒测试', subject: '工具唤醒', wake: true },
+    { agent: { session: { id: 'sA' } } },
+  )
+  assert.equal(result.ok, true)
+  assert.ok(result.message.includes('已唤醒 1'), '回执含唤醒计数')
+  assert.equal(bFollowups.length, 1, 'sB 被 followup 唤醒')
   installed.dispose()
   rmSync(dir, { recursive: true, force: true })
 })

@@ -15,6 +15,10 @@ import {
   searchDocsCommand, searchDocsToolDefinition, searchFileContents,
 } from '../lib/search-docs.js'
 
+// This suite pins the legacy Chinese output contract; i18n.test.js covers English.
+import { setLocale } from '../lib/i18n.js'
+setLocale('zh')
+
 /** 快速构造一个已解析的插件配置。 */
 function baseConfig(overrides = {}) {
   return {
@@ -63,7 +67,10 @@ test('defaultRoots：始终包含主目录；darwin 包含 /Volumes', () => {
   // darwin 上真实 /Volumes 存在
   assert.ok(existsSync('/Volumes'))
   const winRoots = defaultRoots('win32')
-  assert.ok(winRoots.includes(homedir()))
+  // PR #32（全盘搜索卡死修复）：win32 只收集「探测存在」的盘符——home 所在
+  // 盘只扫 homedir（不含 C:\Windows 等系统目录），其余盘加盘符根。macOS
+  // 上探测无盘符 → 空数组；Windows 实机上 home 所在盘必存在 → 必含 homedir。
+  assert.ok(winRoots.length === 0 || winRoots.includes(homedir()))
 })
 
 test('resolveProviders：auto 按平台排序并探测（本机 darwin → mdfind 优先）', () => {

@@ -1,10 +1,16 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { spawnSync } from 'node:child_process'
-import { apply, gitBranch, gitBranchList, resolveConfig, renderSnapshot, resolveRevealTarget, toWindowsPath } from '../lib/index.js'
+import { apply, gitBranch, gitBranchList, inject, resolveConfig, renderSnapshot, resolveRevealTarget, toWindowsPath, RUNTIME_KEYS, validateRuntimePatch } from '../lib/index.js'
+import { setLocale, getLocale } from '../lib/i18n.js'
+import { installCanvas } from '../lib/canvas.js'
+import { PLUGIN_SOURCE_KIND } from '../lib/coi/source.js'
+
+// This suite pins the legacy Chinese output contract; i18n.test.js covers English.
+setLocale('zh')
 import { MemoryStore, projectHash } from '../lib/store.js'
 
 /** Whether `git` is available in this environment (skip git tests otherwise). */
@@ -40,7 +46,15 @@ function fakeCtx(overrides = {}) {
   const state = { tools: [], contexts: [], commands: [], listeners: [], routes: [] }
   const services = {
     tools: {
-      register: (def) => { state.tools.push(def); return () => {} },
+      register: (def) => {
+        state.tools.push(def)
+        // 返回真正移除的 disposer（与 DSH tools.register 一致）：测试
+        // installCanvas().dispose() 注销工具需要它（2026-08-14 PR #8）。
+        return () => {
+          const i = state.tools.indexOf(def)
+          if (i >= 0) state.tools.splice(i, 1)
+        }
+      },
       get: () => undefined, // no extra tools (e.g. agent_session_read) by default
     },
     systemPrompt: { context: (def) => { state.contexts.push(def); return () => {} } },
@@ -48,6 +62,9 @@ function fakeCtx(overrides = {}) {
     webServer: { register: (route) => { state.routes.push(route); return () => {} } },
     ...(overrides.services ?? {}),
   }
+  // Locale settings service: this suite pins Chinese output, so apply()'s
+  // boot-time resolveLocale() must see preference 'zh' explicitly.
+  const settingsService = { get: (ns) => (ns === 'locale' ? { preference: 'zh' } : undefined) }
   const ctx = {
     state,
     tools: services.tools,
@@ -69,7 +86,7 @@ function fakeCtx(overrides = {}) {
       const disposer = fn()
       return disposer ?? (() => {})
     },
-    get: (key) => services[key],
+    get: (key) => services[key] ?? (key === 'settings' ? settingsService : undefined),
     logger: { warn: () => {}, info: () => {}, error: () => {} },
     ...overrides,
   }
@@ -146,6 +163,24 @@ test('tool parameters use standard JSON Schema wrapper (DSH tools.register contr
   }
 })
 
+test('installCanvas：de_canvas 注册 + dispose 注销（PR #8 回归护栏）', () => {
+  // 2026-08-14 回归护栏（PR #8）：de_canvas 必须经 ctx.effect 直接注册
+  // ——ctx.inject(['tools'], cb) 是 ctx.plugin({inject, apply}) 简写，创建
+  // 子 fiber 等待 'tools' 在 cordis 服务注册表解析；但 DSH 的 ctx.tools
+  // 不是 cordis registry 服务（靠插件声明式 inject 挂载），子 fiber 永远
+  // PENDING、回调永不触发，工具从未注册（与 session-orch.js 2026-08-09
+  // 「ctx.inject 动态注入不可靠」教训同源）。
+  // 且 installCanvas().dispose() 必须注销工具——否则用户关闭 canvasEnabled
+  // 后 de_canvas 仍残留到插件重载，违反「关闭时 Tab 与工具完全不可见」。
+  const ctx = fakeCtx()
+  const installed = installCanvas(ctx, { memoryDir: 'tmp' }, () => null, () => null)
+  const names = () => ctx.state.tools.map((t) => t.name)
+  assert.ok(names().includes('de_canvas'), '安装后 de_canvas 必须已注册')
+  assert.ok(ctx.state.routes.some((r) => r.kind === 'prefix'), '安装后画板 HTTP API 必须已注册')
+  installed.dispose()
+  assert.ok(!names().includes('de_canvas'), 'dispose 后 de_canvas 必须已注销（开关关闭场景）')
+})
+
 test('resolveConfig defaults and validation', () => {
   const config = resolveConfig({})
   assert.equal(config.reviewEnabled, false)
@@ -186,6 +221,19 @@ test('apply registers memory tool and snapshot context by default', () => {
   assert.ok(!ctx.state.tools.some((t) => t.name === 'memory_suggest'), 'suggest tool off by default')
   assert.ok(ctx.state.commands.some((c) => c.name === 'memory_review'), 'review command registered')
   clean(dir)
+})
+
+test('headless host activation does not require the web-only workspaceRegistry service', () => {
+  assert.equal(inject.includes('workspaceRegistry'), false)
+  const dir = tempDir()
+  try {
+    const ctx = fakeCtx()
+    apply(ctx, { memoryDir: dir })
+    assert.ok(ctx.state.tools.some((tool) => tool.name === 'memory'))
+    assert.ok(ctx.state.contexts.some((context) => context.name === 'memory:snapshot'))
+  } finally {
+    clean(dir)
+  }
 })
 
 test('search docs tool: 默认禁用不注册；配置/运行时 state 开启后注册；命令始终注册', () => {
@@ -307,7 +355,9 @@ test('review status tool counts message turns and stays due until complete', asy
   const tool = ctx.state.tools.find((t) => t.name === 'memory_review_status')
   assert.ok(tool, 'review status tool registered when review enabled')
   assert.ok(ctx.state.tools.some((t) => t.name === 'memory_suggest'), 'suggest tool registered when review enabled')
-  const settled = ctx.state.listeners['agent/settled'][0]
+  // issue #24 修复后：DSH 核心不发 agent/settled，回合正常结束只发
+  // agent/turn-stopping（payload={agent, turn, signal}），监听器随 PR #25 切换事件名
+  const settled = ctx.state.listeners['agent/turn-stopping'][0]
   const agent = (id, turns) => ({
     id,
     session: {
@@ -323,7 +373,7 @@ test('review status tool counts message turns and stays due until complete', asy
   const exec = (id) => ({ agent: { id }, callId: 'c1', signal: new AbortController().signal })
 
   // turn 1: count 1, below the interval → not due
-  settled(agent('s1', [1]), 1, { kind: 'completed' })
+  settled({ agent: agent('s1', [1]), turn: 1 })
   let check = await tool.execute({ action: 'check' }, exec('s1'))
   assert.equal(check.due, false)
   assert.equal(check.turnsSinceReview, 1)
@@ -331,13 +381,13 @@ test('review status tool counts message turns and stays due until complete', asy
   assert.equal(check.mode, 'suggest')
 
   // turn 2: count 2 → due
-  settled(agent('s1', [1, 2]), 2, { kind: 'completed' })
+  settled({ agent: agent('s1', [1, 2]), turn: 2 })
   check = await tool.execute({ action: 'check' }, exec('s1'))
   assert.equal(check.due, true)
 
   // Due is sticky: another turn without complete keeps it due — a missed or
   // interrupted review is never silently dropped.
-  settled(agent('s1', [1, 2, 3]), 3, { kind: 'completed' })
+  settled({ agent: agent('s1', [1, 2, 3]), turn: 3 })
   check = await tool.execute({ action: 'check' }, exec('s1'))
   assert.equal(check.due, true)
   assert.equal(check.turnsSinceReview, 3)
@@ -350,7 +400,7 @@ test('review status tool counts message turns and stays due until complete', asy
   assert.equal(check.turnsSinceReview, 0)
 
   // complete before due does NOT reset — due=false must not silently delay the review
-  settled(agent('s3', [1]), 1, { kind: 'completed' })
+  settled({ agent: agent('s3', [1]), turn: 1 })
   const premature = await tool.execute({ action: 'complete' }, exec('s3'))
   assert.equal(premature.ok, true)
   assert.ok(premature.message.includes('未到期'))
@@ -359,9 +409,9 @@ test('review status tool counts message turns and stays due until complete', asy
 
   // non-message turns and subagent origins never count
   const retryAgent = { id: 's2', session: { header: { origin: undefined }, events: [{ type: 'turn/start', data: { turn: 1, trigger: { kind: 'retry' } } }] } }
-  settled(retryAgent, 1, { kind: 'completed' })
+  settled({ agent: retryAgent, turn: 1 })
   const childAgent = { id: 'child', session: { header: { origin: 'subagent' }, events: [{ type: 'turn/start', data: { turn: 1, trigger: { kind: 'message' } } }] } }
-  settled(childAgent, 1, { kind: 'completed' })
+  settled({ agent: childAgent, turn: 1 })
   check = await tool.execute({ action: 'check' }, exec('s2'))
   assert.equal(check.turnsSinceReview, 0)
   check = await tool.execute({ action: 'check' }, exec('child'))
@@ -529,21 +579,69 @@ test('renderSnapshot injects key facts but keeps project and daily on-demand', a
   assert.ok(snapshot.includes('target=project'))
   // per-turn duties: one minimal checklist, text-first tool-after pattern
   assert.ok(snapshot.includes('每轮收尾'))
-  assert.ok(snapshot.includes('先输出完整回复文本，再在文本之后附带工具调用'))
-  assert.ok(snapshot.includes('严禁先调工具'))
+  assert.ok(snapshot.includes('每轮收尾分两步'))
+  assert.ok(snapshot.includes('下一条消息输出完整回复'))
   assert.ok(snapshot.includes('一次调用'))
   assert.ok(snapshot.includes('entries 数组'))
   assert.ok(snapshot.includes('内容不要自带时间/日期前缀'))
   // key duty: importance-gated, never a per-turn mandate — and it goes
   // through user confirmation now (提交建议)
   assert.ok(snapshot.includes('重要项目事实'))
-  assert.ok(snapshot.includes('target=key 提交 1 条建议'))
+  assert.ok(snapshot.includes('向 target=key 提交 1 条建议'))
+  // issue #58：必须写明用**哪个**工具——memory_suggest 的 target 白名单里没有
+  // key（见 lib/review.js），只写 "向 target=key 提交建议" 会让模型照字面选错工具。
+  assert.ok(snapshot.includes('memory 工具 action=add'), 'key 建议必须点名 memory 工具的 action=add')
+  assert.ok(!snapshot.includes('memory_suggest target=key'), '不得引导到 memory_suggest（它不接受 key）')
   // subagent sessions get the restrained wording instead of the per-turn duty
   const subSnapshot = renderSnapshot(config, store, { id: 's', session: { header: { origin: 'subagent' } } })
   assert.ok(subSnapshot.includes('独立成果'))
   assert.ok(subSnapshot.includes('不要为写而写'))
   assert.ok(!subSnapshot.includes('每轮收尾'))
   assert.ok(!subSnapshot.includes('各写 1 条'))
+  clean(dir)
+})
+
+test('issue #43: the dtodo turn-end hint reaches user sessions only, never subagents', () => {
+  const dir = tempDir()
+  const config = resolveConfig({ memoryDir: dir })
+  const store = new MemoryStore(config.memoryDir, config)
+  // 真人会话：保留「收尾检查待办」职责（dtodo 提示是面向用户的收尾指令）
+  const user = renderSnapshot(config, store, { id: 'a', session: { header: {} } })
+  assert.ok(user.includes('待办（dtodo）'))
+  assert.ok(user.includes('收尾时调用 dtodo list'))
+  // 子代理：收尾段整体降级，dtodo 提示必须一并豁免（issue #43 根因：
+  // 同一函数内 review 计数 / 写入看门狗 / 收尾标题都已按 isSubagent 降级，
+  // 唯独 todoHint 漏了 → 子代理被诱导多调一次 dtodo 白烧 token）
+  const sub = renderSnapshot(config, store, { id: 'b', session: { header: { origin: 'subagent' } } })
+  assert.ok(!sub.includes('待办（dtodo）'), 'subagent snapshot never carries the dtodo turn-end hint')
+  assert.ok(!sub.includes('收尾时调用 dtodo list'))
+  // 头部工具清单的事实陈述保留（子代理确实注册了 dtodo 工具），只有收尾指导被豁免
+  assert.ok(sub.includes('dtodo 待办工具'))
+  // 待办能力关闭时两边都不注入该提示
+  const off = resolveConfig({ memoryDir: dir, todoEnabled: false })
+  const offStore = new MemoryStore(off.memoryDir, off)
+  const offUser = renderSnapshot(off, offStore, { id: 'a', session: { header: {} } })
+  assert.ok(!offUser.includes('待办（dtodo）'))
+  clean(dir)
+})
+
+test('issue #53: 快照段净化记忆正文的 {{...}}，防宿主段渲染器 throw', () => {
+  const dir = tempDir()
+  const config = resolveConfig({ memoryDir: dir })
+  const store = new MemoryStore(config.memoryDir, config)
+  const agent = { id: 'a', session: { header: { cwd: '/proj/x' } } }
+  // 真实案例（issue #53）：模型把配置片段当事实记进 KEY 轨，宿主未注册 session
+  store.add('key', 'settings.yaml: headers: {x-opencode-session: {{session}}}', agent)
+  // 记忆里的 {{date}} 是"要记录的字面事实"，不是"待展开的模板"——不得被展开成日期
+  store.add('memory', '提示词正文里可用 {{date}} 占位', agent)
+  // 会话标题同样来自用户输入，可能带 {{...}}（第五参数 = ctx.sessionTitle）
+  const snap = renderSnapshot(config, store, agent, undefined, '排查 {{session}} 报错')
+  // 宿主 interpolate 的正则 /^\{\{([^{}]*)\}\}/：快照里不得再有可解析组，
+  // 否则 memory:snapshot 整段渲染失败 → preStep 失败 → 该会话每轮起不来
+  assert.equal((snap.match(/\{\{[^{}]*\}\}/g) ?? []).length, 0, '快照不得携带宿主可解析的 {{...}}')
+  // 只降级一层大括号：语义保留（不展开、不删除）
+  assert.ok(snap.includes('{x-opencode-session: {session}}'), '未注册变量降级为单花括号')
+  assert.ok(snap.includes('{date}'), '{{date}} 在记忆正文中保持字面（不展开为日期）')
   clean(dir)
 })
 
@@ -567,17 +665,17 @@ test('renderSnapshot per-turn write switches compose the hint per track', () => 
   // both off: the key duty (default on) keeps the checklist alive
   const none = renderSnapshot(resolveConfig({ memoryDir: dir, perTurnProjectWrites: false, perTurnDailyWrites: false }), store, agent)
   assert.ok(none.includes('每轮收尾'))
-  assert.ok(none.includes('target=key 提交 1 条建议'))
+  assert.ok(none.includes('向 target=key 提交 1 条建议'))
   assert.ok(none.includes('target=project'))
   assert.ok(none.includes('target=daily'))
   // all three off: no write duty at all, hint degrades to on-demand reads
   const allOff = renderSnapshot(resolveConfig({ memoryDir: dir, perTurnProjectWrites: false, perTurnDailyWrites: false, perTurnKeyWrites: false }), store, agent)
-  assert.ok(!allOff.includes('target=key 提交 1 条建议'))
+  assert.ok(!allOff.includes('向 target=key 提交 1 条建议'))
   assert.ok(!allOff.includes('每轮收尾'))
   // key off: only daily/project keep their write duties
   const noKey = renderSnapshot(resolveConfig({ memoryDir: dir, perTurnKeyWrites: false }), store, agent)
   assert.ok(noKey.includes('含 target=daily 与 target=project 各一项'))
-  assert.ok(!noKey.includes('target=key 提交 1 条建议'))
+  assert.ok(!noKey.includes('向 target=key 提交 1 条建议'))
   clean(dir)
 })
 
@@ -613,6 +711,197 @@ test('renderSnapshot review section: main sessions only, when enabled, static te
   assert.ok(!sub.includes('memory_review_status'))
   assert.ok(sub.includes('独立成果'))
   clean(dir)
+})
+
+test('renderSnapshot write watchdog: warns past the threshold, static text, switches respected', () => {
+  const dir = tempDir()
+  // 看门狗默认关（用户拍板 2026-09-04）——显式开启后测行为。
+  const config = resolveConfig({ memoryDir: dir, perTurnWriteGuard: true })
+  const store = new MemoryStore(config.memoryDir, config)
+  const agent = { id: 'a', session: { header: { cwd: '/proj/x' } } }
+  const gap = (n) => ({ gapOf: () => n, noteWrite: () => {} })
+  // 默认关（不传 perTurnWriteGuard）：gap 再大也不提醒
+  const guardOff = renderSnapshot(resolveConfig({ memoryDir: dir }), store, agent, undefined, null, gap(9))
+  assert.ok(!guardOff.includes('记忆写入遗漏提醒'), 'default-off: never warns')
+  // below threshold (default 2): the fixed duty text stays, no warning
+  const fresh = renderSnapshot(config, store, agent, undefined, null, gap(1))
+  assert.ok(!fresh.includes('记忆写入遗漏提醒'))
+  assert.ok(fresh.includes('每轮收尾'), 'fixed duty hint stays')
+  // at/above threshold: sticky warning appended after the turn-end block
+  const due1 = renderSnapshot(config, store, agent, undefined, null, gap(2))
+  assert.ok(due1.includes('⚠️ **记忆写入遗漏提醒**'))
+  assert.ok(due1.includes('补写'))
+  assert.ok(due1.includes('每轮一条'))
+  // static text per config (no live count baked in) — cache-friendly: the
+  // warning reads identical at gap 2 and gap 9, so an open gap costs at most
+  // two snapshot tails (appear + disappear)
+  const due9 = renderSnapshot(config, store, agent, undefined, null, gap(9))
+  const sliceFrom = (text) => text.slice(text.indexOf('⚠️ **记忆写入遗漏提醒**'))
+  assert.equal(sliceFrom(due1), sliceFrom(due9))
+  // guard off → silent regardless of the gap
+  const off = renderSnapshot(resolveConfig({ memoryDir: dir, perTurnWriteGuard: false }), store, agent, undefined, null, gap(9))
+  assert.ok(!off.includes('记忆写入遗漏提醒'))
+  // custom threshold respected on both sides
+  const cfg5 = resolveConfig({ memoryDir: dir, perTurnWriteGuard: true, writeGuardThreshold: 5 })
+  assert.ok(!renderSnapshot(cfg5, store, agent, undefined, null, gap(4)).includes('记忆写入遗漏提醒'))
+  assert.ok(renderSnapshot(cfg5, store, agent, undefined, null, gap(5)).includes('记忆写入遗漏提醒'))
+  // P1-4: 单轨关闭时警告文案只写启用的轨（不命令模型写已关闭的 project）
+  const projOff = renderSnapshot(
+    resolveConfig({ memoryDir: dir, perTurnWriteGuard: true, perTurnProjectWrites: false }),
+    store, agent, undefined, null, gap(9),
+  )
+  assert.ok(projOff.includes('记忆写入遗漏提醒'))
+  // 警告段切片断言：只含启用的 target=daily，不含 target=project
+  //（快照别处的"读取用 target=project"是固定用法说明，不属于警告）。
+  const projOffWarn = projOff.slice(projOff.indexOf('⚠️ **记忆写入遗漏提醒**'))
+  assert.ok(projOffWarn.includes('target=daily'))
+  assert.ok(!projOffWarn.includes('target=project'), 'closed track must not be demanded in the warning')
+  // write duty fully off (both tracks) → nothing to be overdue about
+  const noDuty = renderSnapshot(resolveConfig({ memoryDir: dir, perTurnWriteGuard: true, perTurnProjectWrites: false, perTurnDailyWrites: false }), store, agent, undefined, null, gap(9))
+  assert.ok(!noDuty.includes('记忆写入遗漏提醒'))
+  // subagent sessions never get the watchdog warning
+  const sub = renderSnapshot(config, store, { id: 's', session: { header: { origin: 'subagent' } } }, undefined, null, gap(9))
+  assert.ok(!sub.includes('记忆写入遗漏提醒'))
+  // legacy callers without a counter → never warns, never throws
+  const legacy = renderSnapshot(config, store, agent)
+  assert.ok(!legacy.includes('记忆写入遗漏提醒'))
+  // config plumbing: runtime keys + validation (convention shared with the
+  // perTurn* switches)
+  assert.ok(RUNTIME_KEYS.includes('perTurnWriteGuard'))
+  assert.ok(RUNTIME_KEYS.includes('writeGuardThreshold'))
+  validateRuntimePatch('perTurnWriteGuard', true)
+  validateRuntimePatch('perTurnWriteGuard', false)
+  assert.throws(() => validateRuntimePatch('perTurnWriteGuard', 'yes'), /布尔/)
+  validateRuntimePatch('writeGuardThreshold', 1)
+  assert.throws(() => validateRuntimePatch('writeGuardThreshold', 0), /writeGuardThreshold/)
+  assert.throws(() => validateRuntimePatch('writeGuardThreshold', 2.5), /writeGuardThreshold/)
+  // P2-1: 静态配置同样拒绝小数（resolveConfig 与运行时校验口径一致）
+  assert.throws(() => resolveConfig({ memoryDir: dir, writeGuardThreshold: 1.5 }), /writeGuardThreshold/)
+  clean(dir)
+})
+
+test('write watchdog counter: counts turns, resets on daily/project writes, honors switches', async () => {
+  const dir = tempDir()
+  const ctx = fakeCtx()
+  // 显式开启看门狗（默认关）
+  apply(ctx, { memoryDir: dir, perTurnWriteGuard: true })
+  // review counter + write watchdog both listen on agent/turn-stopping; fire
+  // all listeners like a real dispatch would (the review one early-returns,
+  // reviewEnabled is off here)
+  const listeners = ctx.state.listeners['agent/turn-stopping'] ?? []
+  assert.ok(listeners.length >= 2, 'review counter + write watchdog both registered')
+  const fire = (payload) => { for (const listener of listeners) listener(payload) }
+
+  // 官方真实事件形状（0.1.2）：turn/start 只有 { turn }（无 trigger 字段）；
+  // user/message 的 source.kind 决定是不是真人回合（P1-3：广播 wake 等
+  // plugin 注入的回合不算用户回合）。
+  const events = []
+  let seq = 0
+  const pushTurn = (sourceKind) => {
+    seq += 1
+    events.push({ type: 'turn/start', seq, data: { turn: seq } })
+    seq += 1
+    events.push({
+      type: 'user/message',
+      seq,
+      data: {
+        id: `u${seq}`,
+        turn: seq,
+        // 'plugin' = 注入/唤醒回合（广播 wake followup 等），'user' = 真人回合
+        // （v4 的注入 kind 是 producer-owned 的 `plugin:<包名>`，不再是裸 'plugin'）
+        source: sourceKind === 'plugin' ? { kind: PLUGIN_SOURCE_KIND, form: 'notice' } : { kind: 'user' },
+      },
+    })
+  }
+  const agent = (id, origin = 'user') => ({
+    id,
+    session: {
+      header: { origin, cwd: '/proj/x' },
+      // 0.1.2 新式 Session 只暴露 ownEvents()（老宿主 .events 已在别处覆盖）
+      ownEvents: () => events,
+    },
+  })
+  const contextDef = ctx.state.contexts.find((c) => c.name === 'memory:snapshot')
+  assert.ok(contextDef, 'memory snapshot context registered')
+  const renderFor = (a) => contextDef.text({ agent: a })
+  const memory = ctx.state.tools.find((t) => t.name === 'memory')
+  assert.ok(memory, 'memory tool registered')
+  const main = agent('w1')
+
+  // 回合 1/2：连续未写 → gap 2 触发提醒
+  pushTurn('user')
+  fire({ agent: main, turn: 1 })
+  assert.ok(!renderFor(main).includes('记忆写入遗漏提醒'), 'gap 1 < threshold 2: no warning yet')
+  pushTurn('user')
+  fire({ agent: main, turn: 2 })
+  assert.ok(renderFor(main).includes('⚠️ **记忆写入遗漏提醒**'), 'gap 2 >= threshold: warning appears')
+
+  // 回合 3：写 daily/project → noteWrite 标记 → 本轮 turn-stopping 清零
+  // （⚠ 时序回归：只打标记不清零，turn-stopping 消费标记——旧实现当场
+  // 清零后再 +1 会把"已写回合"也算欠账，阈值 2 少漏 1 轮就误报）。
+  pushTurn('user')
+  const exec = { agent: main, callId: 'c1', signal: new AbortController().signal }
+  const wrote = await memory.execute({
+    action: 'add',
+    entries: [
+      { target: 'daily', content: '回合 3 进展' },
+      { target: 'project', content: '回合 3 项目进展' },
+    ],
+  }, exec)
+  assert.equal(wrote.ok, true)
+  fire({ agent: main, turn: 3 })
+  assert.ok(!renderFor(main).includes('记忆写入遗漏提醒'), 'written turn must NOT count as a gap (P1-2 regression)')
+
+  // 回合 4：没写 → gap 1（仍不提醒）；回合 5：没写 → gap 2 再提醒
+  pushTurn('user')
+  fire({ agent: main, turn: 4 })
+  assert.ok(!renderFor(main).includes('记忆写入遗漏提醒'), 'gap restarted at 1')
+  pushTurn('user')
+  fire({ agent: main, turn: 5 })
+  assert.ok(renderFor(main).includes('记忆写入遗漏提醒'), 'gap 2 again')
+
+  // key-track writes (confirmation queue) must NOT reset the gap
+  const keyWrite = await memory.execute({ action: 'add', target: 'key', content: '某长期约定' }, exec)
+  assert.equal(keyWrite.ok, true)
+  assert.ok(renderFor(main).includes('记忆写入遗漏提醒'), 'key suggestion does not clear the warning')
+
+  // 插件注入回合（broadcast wake followup：source.kind=plugin）不计入欠账
+  pushTurn('plugin')
+  fire({ agent: main, turn: 6 })
+  pushTurn('plugin')
+  fire({ agent: main, turn: 7 })
+  assert.ok(renderFor(main).includes('记忆写入遗漏提醒'), 'gap stays (plugin turns are not user turns)')
+  pushTurn('user')
+  fire({ agent: main, turn: 8 })
+  pushTurn('plugin')
+  fire({ agent: main, turn: 9 })
+  assert.ok(renderFor(main).includes('记忆写入遗漏提醒'), 'only the user turn advances the gap (3 >= 2)')
+
+  // subagent turns are never counted
+  const sub = agent('w2', 'subagent')
+  pushTurn('user')
+  fire({ agent: sub, turn: 1 })
+  pushTurn('user')
+  fire({ agent: sub, turn: 2 })
+  assert.ok(!renderFor(sub).includes('记忆写入遗漏提醒'), 'subagent sessions never warn')
+  clean(dir)
+
+  // default-off via config: 开关默认关（用户拍板）——不计数、不提醒
+  const dir2 = tempDir()
+  const ctx2 = fakeCtx()
+  apply(ctx2, { memoryDir: dir2 })
+  const listeners2 = ctx2.state.listeners['agent/turn-stopping'] ?? []
+  const fire2 = (payload) => { for (const listener of listeners2) listener(payload) }
+  const contextDef2 = ctx2.state.contexts.find((c) => c.name === 'memory:snapshot')
+  const other = agent('w3')
+  pushTurn('user')
+  fire2({ agent: other, turn: 1 })
+  pushTurn('user')
+  fire2({ agent: other, turn: 2 })
+  pushTurn('user')
+  fire2({ agent: other, turn: 3 })
+  assert.ok(!contextDef2.text({ agent: other }).includes('记忆写入遗漏提醒'), 'default off: never warns')
+  clean(dir2)
 })
 
 test('gitBranch resolves the current branch; gitBranchList lists branches', () => {
@@ -870,4 +1159,137 @@ test('de_prompts tool: promptsEnabled 开关注册/注销，list/get/inject 与�
   assert.ok(ctx2.state.tools.some((t) => t.name === 'my_prompts'))
   assert.ok(!ctx2.state.tools.some((t) => t.name === 'de_prompts'))
   clean(dir2)
+})
+
+test('systemPrompt context duplicate registration is tolerated (issue #23 idempotent guard)', async () => {
+  // 模拟宿主重复装配（DSH 0.1.x loader 曾把插件在无 scope 标签的 ctx 上
+  // apply 两次）：systemPrompt.context 第二次插入同名时抛 exactly
+  // dsh-system-prompt 的 global 层 duplicate 错误。修复前 apply 会整体抛错，
+  // 连带快照注入失效 + /memory-evolve/api/* 404。
+  const duplicateMessage = 'prompt context "memory:snapshot" is already registered (for a per-agent override, register through that agent\'s `agent.ctx` instead)'
+
+  // 场景 1：memory:snapshot 重复 → apply 不抛错，其余装配照常
+  const dir = tempDir()
+  const ctx = fakeCtx({
+    services: {
+      systemPrompt: {
+        context: () => { throw new Error(duplicateMessage) },
+      },
+    },
+  })
+  apply(ctx, { memoryDir: dir })
+  assert.ok(ctx.state.tools.some((t) => t.name === 'memory'), 'memory tool still registered after duplicate guard')
+  assert.ok(ctx.state.tools.some((t) => t.name === 'skill_manage'), 'skill tool still registered after duplicate guard')
+  clean(dir)
+
+  // 场景 2：prompt:injections 重复（prompts 模块开启时同款保护）
+  const dir2 = tempDir()
+  const ctx2 = fakeCtx({
+    services: {
+      systemPrompt: {
+        context: () => { throw new Error('prompt context "prompt:injections" is already registered in this scope') },
+      },
+    },
+  })
+  apply(ctx2, { memoryDir: dir2, promptsEnabled: true })
+  assert.ok(ctx2.state.tools.some((t) => t.name === 'de_prompts'), 'prompts tool still registered after duplicate guard')
+  clean(dir2)
+
+  // 场景 3：非 duplicate 的系统性错误必须照抛（保护只吞 "already registered"）
+  const dir3 = tempDir()
+  const ctx3 = fakeCtx({
+    services: {
+      systemPrompt: {
+        context: () => { throw new Error('systemPrompt exploded for another reason') },
+      },
+    },
+  })
+  assert.throws(() => apply(ctx3, { memoryDir: dir3 }), /systemPrompt exploded for another reason/)
+  clean(dir3)
+})
+
+// ---------------------------------------------------------------------------
+// issue #58：内置技能同步与 COI 调度解耦
+//
+// 装配级回归（单元级在 tests/skills-sync-decoupled.test.js）。此前的同步调用
+// 点挂在 installCoi() 内，而 installCoi 由 coiEnabled 门控（默认 false）——
+// 默认配置下内置技能永远不会进技能库。这里跑的是**真实的 apply()**：
+// coiEnabled=false 也必须同步（这条用例在旧实现下必失败）。
+
+/** 技能库里已落地的技能目录名。 */
+function installedSkills(skillsDir) {
+  return existsSync(skillsDir) ? readdirSync(skillsDir) : []
+}
+
+test('issue #58：coiEnabled=false 时 apply() 仍然同步内置技能', () => {
+  const dir = tempDir()
+  const skills = join(dir, 'user-skills')
+  const ctx = fakeCtx()
+  try {
+    apply(ctx, { memoryDir: dir, skillDir: skills, coiEnabled: false })
+    const installed = installedSkills(skills)
+    assert.ok(
+      installed.includes('memory-consolidate'),
+      `coiEnabled=false 也必须同步内置技能（旧实现下一个都不会有），实际：${JSON.stringify(installed)}`,
+    )
+    assert.equal(installed.length, 5, '五个内置技能都应落盘')
+  } finally {
+    clean(dir)
+  }
+})
+
+test('issue #58：coiSyncSkills=false 是唯一的关断开关（与 coiEnabled 无关）', () => {
+  const dir = tempDir()
+  const skills = join(dir, 'user-skills')
+  const ctx = fakeCtx()
+  try {
+    // coiEnabled 开着也照样不同步——开关语义只由 coiSyncSkills 决定
+    apply(ctx, { memoryDir: dir, skillDir: skills, coiEnabled: true, coiSyncSkills: false })
+    assert.equal(existsSync(skills), false, 'coiSyncSkills=false 时不得写入技能库')
+  } finally {
+    clean(dir)
+  }
+})
+
+// —— DSH 0.2.0 适配：settings 服务读法与提交事件改名（2026-09-28）——
+// 0.2.0-rc.1 起 settings.get() 被移除（改 describe()），'settings/updated' 改名
+// 'settings/document-updated'。此处验证 apply() 的 locale 监听器在新老宿主上
+// 都能就地跟随语言切换——否则语言设置要重启才生效（静默降级，无报错）。
+test('locale watcher follows both the legacy and the 0.2.0 settings events', () => {
+  // 场景 1（老宿主）：get() 形态 + 'settings/updated'
+  const legacy = { get: (ns) => (ns === 'locale' ? { preference: 'en' } : undefined) }
+  const ctxLegacy = fakeCtx({ services: { settings: legacy } })
+  apply(ctxLegacy, { memoryDir: tempDir(), reviewEnabled: false })
+  assert.ok(Array.isArray(ctxLegacy.state.listeners['settings/updated']), 'legacy event subscribed')
+  assert.ok(Array.isArray(ctxLegacy.state.listeners['settings/document-updated']), 'new event subscribed too')
+  assert.equal(getLocale(), 'en', 'boot-time resolve reads the legacy get() service')
+
+  // 场景 2（新宿主）：只有 describe()，事件走 'settings/document-updated'
+  const describeOnly = {
+    describe: () => [{ ns: 'locale', value: { preference: 'zh' }, schema: {}, revision: 1 }],
+  }
+  const dir2 = tempDir()
+  const ctxNew = fakeCtx({ services: { settings: describeOnly } })
+  apply(ctxNew, { memoryDir: dir2, reviewEnabled: false })
+  assert.equal(getLocale(), 'zh', 'boot-time resolve reads the describe() service')
+
+  // 用户把语言切成 en → 提交事件带 ns='locale' → 插件立刻改口
+  // （服务返回可变引用：apply() 期间是 zh，翻开关后再读就是 en）
+  let preference = 'zh'
+  const flipped = {
+    describe: () => [{ ns: 'locale', value: { preference }, schema: {}, revision: preference === 'en' ? 2 : 1 }],
+  }
+  const ctxFlip = fakeCtx({ services: { settings: flipped } })
+  const dir3 = tempDir()
+  apply(ctxFlip, { memoryDir: dir3, reviewEnabled: false })
+  assert.equal(getLocale(), 'zh', 'boot resolves the describe() service before the flip')
+  preference = 'en'
+  for (const listener of ctxFlip.state.listeners['settings/document-updated']) listener('locale', 2)
+  assert.equal(getLocale(), 'en', 'live language switch applies without restart')
+  for (const listener of ctxFlip.state.listeners['settings/document-updated']) listener('models', 3)
+  assert.equal(getLocale(), 'en', 'other namespaces leave the locale untouched')
+
+  setLocale('zh')
+  clean(dir2)
+  clean(dir3)
 })

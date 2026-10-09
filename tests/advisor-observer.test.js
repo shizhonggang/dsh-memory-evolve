@@ -9,6 +9,10 @@ import {
 } from '../lib/advisor/observer.js'
 import { ADVISOR_SOURCE_KIND } from '../lib/advisor/kinds.js'
 
+// This suite pins the legacy Chinese output contract; i18n.test.js covers English.
+import { setLocale } from '../lib/i18n.js'
+setLocale('zh')
+
 // ---------------------------------------------------------------------------
 // 事件与消息构造
 // ---------------------------------------------------------------------------
@@ -156,7 +160,7 @@ test('isRewriteEvent：compact/* 与非 append surfaceOp', () => {
 test('isHumanInputEvent：user 消息 / inbox 拼接含 user；工具结果不算', () => {
   assert.ok(isHumanInputEvent(userEvent('你好')))
   assert.equal(isHumanInputEvent(userEvent('工具结果', { kind: 'tool' })), false)
-  assert.equal(isHumanInputEvent(userEvent('注入', { kind: 'plugin', plugin: 'x' })), false)
+  assert.equal(isHumanInputEvent(userEvent('注入', { kind: 'plugin:dsh-memory-evolve', form: 'notice' })), false)
   assert.equal(isHumanInputEvent(userEvent('advisor', { kind: ADVISOR_SOURCE_KIND })), false)
   assert.ok(isHumanInputEvent({ type: 'agent/inbox/spliced', seq: 1, data: { inserted: [{ source: { kind: 'user' } }] } }))
   assert.equal(isHumanInputEvent({ type: 'agent/inbox/spliced', seq: 1, data: { inserted: [{ source: { kind: ADVISOR_SOURCE_KIND } }] } }), false)

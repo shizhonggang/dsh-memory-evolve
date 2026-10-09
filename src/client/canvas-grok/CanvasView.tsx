@@ -8,10 +8,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { ConvViewProps } from '@deepseek-ai/dsh-client-ui-conversation/client'
 import type { Translate } from '@deepseek-ai/dsh-client-ui-slots'
+// 图标走 ../ui-icons.ts 跨版本解析层：DSH 0.2.0 把图标导出从 …16 改成 …Regular，
+// 直接按旧名 import 在新宿主上会拿到 undefined 并让画板整块 UI 崩掉。
 import {
-  IconPlusOutline16,
-  IconSearchOutline16,
-} from '@deepseek-ai/dsh-client-ui-primitives'
+  IconPlusOutline,
+  IconSearchOutline,
+} from '../ui-icons.ts'
 import { CanvasBoard } from './CanvasBoard.tsx'
 import { CanvasDialogs } from './CanvasDialogs.tsx'
 import type { NoteSubmit, PathSubmit } from './CanvasDialogs.tsx'
@@ -45,6 +47,7 @@ import {
   loadCanvasFromBackend,
   migrateNodeBackend,
   openNodeFileBackend,
+  openNodeFolderBackend,
   saveCanvasToBackend,
   type BackendSaveResult,
 } from './api-client.ts'
@@ -423,20 +426,8 @@ export function CanvasView(props: ConvViewProps & CanvasViewProps): JSX.Element 
     showToast(`已上板：${title}`)
   }, [addNode, currentProjectId, sessionId, showToast])
 
-  // 「跳到最近 AI 便签」：真实 AI 写入（de_canvas add_note，后端已接入）
-  // 落会话板中央区并记 lastAiNodeId，此按钮定位到那张便签。
-  const jumpToAi = useCallback(() => {
-    const id = lastAiNodeId
-    const node = id ? nodes.find((n) => n.id === id) : null
-    if (!node) {
-      showToast('还没有 AI 便签')
-      return
-    }
-    setSelectedId(node.id)
-    pulseHighlight(node.id)
-    applyViewport(viewportToNode(node, viewport, stageSize.w, stageSize.h), true)
-  }, [applyViewport, lastAiNodeId, nodes, pulseHighlight, showToast, stageSize.h, stageSize.w, viewport])
-
+  // 「跳到最近 AI 便签」已于 2026-08-14 删除（用户反馈无用）：
+  // lastAiNodeId 仍保留为持久化字段（boards.json 向后兼容），仅移除入口。
   const onMoveNode = useCallback((id: string, x: number, y: number, shouldPersist: boolean) => {
     setNodes((prev) => {
       const next = prev.map((n) => {
@@ -509,6 +500,18 @@ export function CanvasView(props: ConvViewProps & CanvasViewProps): JSX.Element 
     }
     const result = await openNodeFileBackend(id)
     showToast(result.ok ? `已用默认应用打开：${node.title}` : `打开失败：${result.error ?? '未知错误'}`)
+  }, [nodes, showToast])
+
+  /** 在系统文件管理器中打开上板文件**所在文件夹**（2026-08-14 用户
+   *  要求：文件类型便签一键直达所在目录；后端对目录节点打开自身）。 */
+  const onOpenFolder = useCallback(async (id: string) => {
+    const node = nodes.find((n) => n.id === id)
+    if (!node?.path) {
+      showToast('该节点没有本地路径可打开')
+      return
+    }
+    const result = await openNodeFolderBackend(id)
+    showToast(result.ok ? `已在文件管理器中打开所在文件夹：${node.title}` : `打开失败：${result.error ?? '未知错误'}`)
   }, [nodes, showToast])
 
   /** 保存文本/便签内容到本机（2026-08-14：弹系统保存对话框，AI 与
@@ -640,7 +643,7 @@ export function CanvasView(props: ConvViewProps & CanvasViewProps): JSX.Element 
         </div>
 
         <label className="cg-search">
-          <IconSearchOutline16 />
+          <IconSearchOutline />
           <input
             value={query}
             placeholder="搜索画板节点…"
@@ -650,22 +653,19 @@ export function CanvasView(props: ConvViewProps & CanvasViewProps): JSX.Element 
 
         <div className="cg-toolbar-group">
           <button type="button" className="cg-btn cg-ghost" onClick={() => setDialog('path')}>
-            <IconPlusOutline16 /> 路径上板
+            <IconPlusOutline /> 路径上板
           </button>
           <button type="button" className="cg-btn cg-ghost" onClick={() => setDialog('note')}>
-            <IconPlusOutline16 /> 便签
+            <IconPlusOutline /> 便签
           </button>
           <button type="button" className="cg-btn cg-ghost" onClick={() => setDialog('catalog')}>
-            <IconPlusOutline16 /> 搜索上板
+            <IconPlusOutline /> 搜索上板
           </button>
         </div>
 
         <div className="cg-toolbar-sep" />
 
         <div className="cg-toolbar-group">
-          <button type="button" className="cg-btn cg-ghost" onClick={jumpToAi} disabled={!lastAiNodeId}>
-            跳到最近 AI 便签
-          </button>
           <button
             type="button"
             className="cg-btn cg-ghost cg-scale"
@@ -707,6 +707,7 @@ export function CanvasView(props: ConvViewProps & CanvasViewProps): JSX.Element 
         onResizeNode={onResizeNode}
         onPreview={onPreview}
         onOpen={onOpen}
+        onOpenFolder={onOpenFolder}
         onSave={onSave}
         onMigrate={onMigrateClick}
         onCopy={onCopy}

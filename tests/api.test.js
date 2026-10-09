@@ -9,6 +9,10 @@ import { installApi } from '../lib/api.js'
 import { validateRuntimePatch } from '../lib/index.js'
 import { TodoStore } from '../lib/todo.js'
 
+// This suite pins the legacy Chinese output contract; i18n.test.js covers English.
+import { setLocale } from '../lib/i18n.js'
+setLocale('zh')
+
 function tempDir() {
   return mkdtempSync(join(tmpdir(), 'dsh-memory-api-test-'))
 }
@@ -189,6 +193,35 @@ test('api memory/key writes a key fact for the session cwd', async () => {
     const byKey = Object.fromEntries(list.data.files.map((f) => [f.key, f]))
     assert.equal(byKey.key.content.includes('本项目约定使用 pnpm'), true)
     assert.equal(list.data.cwd, '/work/p')
+  } finally {
+    await api.close()
+    rmSync(api.dir, { recursive: true, force: true })
+  }
+})
+
+test('api memory/memory and memory/user write global tracks without a cwd', async () => {
+  const api = await bootApi() // resolveCwd 缺省返回 undefined——全局轨不依赖 cwd
+  try {
+    // empty content → 400
+    const empty = await api.request('POST', '/memory-evolve/api/memory/memory', { content: '   ' })
+    assert.equal(empty.status, 400)
+    // happy path: stamped into the global MEMORY.md / USER.md (issue #30)
+    const mem = await api.request('POST', '/memory-evolve/api/memory/memory', {
+      content: '公司内部 Nexus 仓库：nexus.cdyh.local',
+    })
+    assert.equal(mem.status, 200)
+    assert.equal(mem.data.ok, true)
+    const user = await api.request('POST', '/memory-evolve/api/memory/user', { content: '回复默认用中文' })
+    assert.equal(user.status, 200)
+    const memText = readFileSync(join(api.dir, 'MEMORY.md'), 'utf8')
+    const userText = readFileSync(join(api.dir, 'USER.md'), 'utf8')
+    assert.match(memText, /^\[20\d\d-\d\d-\d\d\] 公司内部 Nexus 仓库：nexus\.cdyh\.local$/m)
+    assert.match(userText, /^\[20\d\d-\d\d-\d\d\] 回复默认用中文$/m)
+    // duplicate content is reported, not appended twice
+    const dup = await api.request('POST', '/memory-evolve/api/memory/memory', {
+      content: '公司内部 Nexus 仓库：nexus.cdyh.local',
+    })
+    assert.equal(dup.data.duplicate, true)
   } finally {
     await api.close()
     rmSync(api.dir, { recursive: true, force: true })
